@@ -7,6 +7,7 @@
 #include <glog/logging.h>
 
 #include <fstream>
+#include <iostream>
 #include <mutex>
 #include <sstream>
 
@@ -37,7 +38,11 @@ void declare_config(YggdrasilSink::Config& config) {
 }
 
 YggdrasilSink::YggdrasilSink(const Config& config)
-    : config(config::checkValid(config)), impl_(std::make_unique<Impl>()) {}
+    : config(config::checkValid(config)), impl_(std::make_unique<Impl>()) {
+  // std::cerr, not glog: Hydra's glog setup hides INFO/WARNING from the launch output.
+  std::cerr << "[YggdrasilSink] created, scratch=" << config.scratch_path
+            << " compare_every=" << config.compare_every << std::endl;
+}
 
 YggdrasilSink::~YggdrasilSink() {
   if (config.output_path.empty()) {
@@ -57,28 +62,31 @@ void YggdrasilSink::call(uint64_t timestamp_ns,
                          const spark_dsg::DynamicSceneGraph& graph,
                          const kimera_pgmo::DeformationGraph&) const {
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  // Stage A goes through Hydra's own JSON writer so the mirror sees exactly what dsg.json holds.
-  graph.save(config.scratch_path, false);
-  std::stringstream ss;
-  ss << std::ifstream(config.scratch_path).rdbuf();
-  const std::string json = ss.str();
-
   try {
+    // Stage A goes through Hydra's own JSON writer so the mirror sees exactly what dsg.json holds.
+    graph.save(config.scratch_path, false);
+    std::stringstream ss;
+    ss << std::ifstream(config.scratch_path).rdbuf();
+    const std::string json = ss.str();
+
     const auto stats = impl_->mirror->apply_dsg_json(json);
     ++impl_->updates;
-    VLOG(1) << "[YggdrasilSink] t=" << timestamp_ns << " nodes=" << stats.nodes
-            << " nestings=" << stats.nestings << " import=" << stats.import_us << "us";
+    std::cerr << "[YggdrasilSink] update " << impl_->updates << " t=" << timestamp_ns
+              << " nodes=" << stats.nodes << " nestings=" << stats.nestings
+              << " import=" << stats.import_us / 1000 << "ms" << std::endl;
     if (config.compare_every > 0 && impl_->updates % config.compare_every == 0) {
       const auto r = impl_->mirror->compare_with(json, config.tolerance);
-      LOG_IF(INFO, r.equal) << "[YggdrasilSink] update " << impl_->updates
-                            << " matches Hydra (max pos err " << r.max_position_error << ")";
-      LOG_IF(WARNING, !r.equal) << "[YggdrasilSink] update " << impl_->updates << " differs: nodes -"
-                                << r.missing_nodes << "/+" << r.extra_nodes << " edges -"
-                                << r.missing_edges << "/+" << r.extra_edges << " attrs "
-                                << r.mismatches << "\n" << std::string(r.summary);
+      if (r.equal) {
+        std::cerr << "[YggdrasilSink] update " << impl_->updates << " matches Hydra (max pos err " << r.max_position_error << ")" << std::endl;
+      } else {
+        std::cerr << "[YggdrasilSink] update " << impl_->updates << " differs: nodes -"
+                  << r.missing_nodes << "/+" << r.extra_nodes << " edges -" << r.missing_edges
+                  << "/+" << r.extra_edges << " attrs " << r.mismatches << "\n"
+                  << std::string(r.summary) << std::endl;
+      }
     }
   } catch (const std::exception& e) {
-    LOG(ERROR) << "[YggdrasilSink] update failed: " << e.what();
+    std::cerr << "[YggdrasilSink] update failed: " << e.what() << std::endl;
   }
 }
 

@@ -4,6 +4,8 @@ project(hydra_ygg_sink LANGUAGES CXX)
 find_package(ament_cmake REQUIRED)
 find_package(hydra REQUIRED)
 find_package(config_utilities REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(hydra_ros REQUIRED)
 
 include(FetchContent)
 FetchContent_Declare(Corrosion GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git GIT_TAG v0.5.1)
@@ -21,7 +23,15 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 target_link_libraries(${PROJECT_NAME} PUBLIC hydra::hydra PRIVATE ygg_bridge_cxx)
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
 
+# Standalone listener: mirrors /hydra/backend/dsg without changes to Hydra. Hydra's backend
+# ignores the `sinks` config entry (only code-added sinks run), so this is the path in use.
+add_executable(ygg_mirror_node src/ygg_mirror_node.cpp)
+target_link_libraries(ygg_mirror_node ygg_bridge_cxx)
+ament_target_dependencies(ygg_mirror_node rclcpp hydra_ros)
+target_compile_features(ygg_mirror_node PRIVATE cxx_std_17)
+
 install(TARGETS ${PROJECT_NAME} LIBRARY DESTINATION lib)
+install(TARGETS ygg_mirror_node RUNTIME DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
 ament_export_libraries(${PROJECT_NAME})
 ament_package()

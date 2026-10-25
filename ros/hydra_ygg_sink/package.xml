@@ -8,5 +8,7 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>hydra</depend>
   <depend>config_utilities</depend>
+  <depend>rclcpp</depend>
+  <depend>hydra_ros</depend>
   <export><build_type>ament_cmake</build_type></export>
 </package>

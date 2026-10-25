@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/dsg-convert", "crates/tools"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Published Yggdrasil only; nothing in hydra-ygg patches it. Replace the path with the
+# public git URL pinned to a commit, e.g.
+# scene-graph = { git = "https://github.com/<owner>/Yggdrasil", rev = "<sha>" }
+scene-graph = { path = "../Yggdrasil-master/scene-graph" }
+serde_json = "1"
+dsg-convert = { path = "crates/dsg-convert" }

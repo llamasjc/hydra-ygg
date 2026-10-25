@@ -1,0 +1,3 @@
+target/
+*.json
+!tests/data/*.json

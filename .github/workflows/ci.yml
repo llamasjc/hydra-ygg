@@ -1,0 +1,17 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Until scene-graph is pinned by git URL in Cargo.toml, CI needs the public Yggdrasil
+      # checked out next to this repo.
+      - uses: actions/checkout@v4
+        with:
+          repository: OWNER/Yggdrasil
+          path: Yggdrasil-master
+      - run: mv Yggdrasil-master ..
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings -A dead_code
+      - run: cargo test

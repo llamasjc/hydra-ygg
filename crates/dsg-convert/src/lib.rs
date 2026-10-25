@@ -12,6 +12,8 @@
 //!   edges that cannot be expressed as nesting (second parent, or same layer number) are kept
 //!   as a feature on the node and counted, since those are what the port has to redesign.
 
+pub mod compare;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use scene_graph::{Feature, NodeId, SceneGraph};

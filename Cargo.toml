@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/dsg-convert", "crates/tools"]
+members = ["crates/dsg-convert", "crates/tools", "crates/ygg-bridge"]
 resolver = "2"
 
 [workspace.package]

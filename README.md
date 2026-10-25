@@ -12,12 +12,23 @@ Hydra and Yggdrasil are both used as published; nothing here patches either of t
 | planned: `crates/ygg-delta` | change log, deltas and snapshots between robot and station |
 | planned: `crates/ygg-bridge` | C++-facing API (cxx) that Hydra's sink calls |
 | planned: `crates/station` | global multi-robot graph and backend |
-| planned: `ros/hydra_ygg_sink` | colcon package with Hydra's `YggdrasilSink` |
+| `crates/ygg-bridge` | cxx bridge: Rust mirror API callable from C++ |
+| `ros/hydra_ygg_sink` | colcon package with Hydra's `YggdrasilSink` |
 
 ## Setup
 
-`scene-graph` is a path dependency on a checkout of the public Yggdrasil repo next to this one
-(`../Yggdrasil-master`). Switch it to a pinned git dependency in `Cargo.toml` once the URL is set.
+`scene-graph` comes from the public Yggdrasil repo (github.com/brdsdsu/Yggdrasil), pinned to a
+commit in `Cargo.toml`. `cargo test --workspace` fetches it.
+
+C++ smoke test (what CI runs):
+
+```bash
+cargo build --release -p ygg-bridge
+g++ -std=c++17 -O2 crates/ygg-bridge/tests/smoke.cpp -Itarget/cxxbridge \
+    target/release/libygg_bridge.a -lpthread -ldl -o smoke
+./smoke              # built-in graph
+./smoke dsg.json     # any Hydra export
+```
 
 ## Round-trip check
 

@@ -526,6 +526,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "scene-graph"
 version = "0.1.0"
+source = "git+https://github.com/brdsdsu/Yggdrasil?rev=3b17a94c57f366fb30b04f1d939a21559797b2c1#3b17a94c57f366fb30b04f1d939a21559797b2c1"
 dependencies = [
  "glam",
  "serde",
@@ -606,6 +607,7 @@ checksum = "238653bedf881fede50103cb7838b029e2b73d3d3d8e70d36f0a96be32a65c7b"
 [[package]]
 name = "spatial-index"
 version = "0.1.0"
+source = "git+https://github.com/brdsdsu/Yggdrasil?rev=3b17a94c57f366fb30b04f1d939a21559797b2c1#3b17a94c57f366fb30b04f1d939a21559797b2c1"
 dependencies = [
  "aligned-vec",
  "array-init",

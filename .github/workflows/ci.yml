@@ -5,13 +5,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Until scene-graph is pinned by git URL in Cargo.toml, CI needs the public Yggdrasil
-      # checked out next to this repo.
-      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          repository: OWNER/Yggdrasil
-          path: Yggdrasil-master
-      - run: mv Yggdrasil-master ..
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings -A dead_code
-      - run: cargo test
+      - run: cargo test --workspace
+  cpp-smoke:
+    # Links the bridge from C++ the same way the Hydra sink does.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p ygg-bridge
+      - run: >
+          g++ -std=c++17 -O2 crates/ygg-bridge/tests/smoke.cpp -Itarget/cxxbridge
+          target/release/libygg_bridge.a -lpthread -ldl -o smoke
+      - run: ./smoke

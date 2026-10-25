@@ -9,7 +9,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # Published Yggdrasil only; nothing in hydra-ygg patches it. Replace the path with the
 # public git URL pinned to a commit, e.g.
-# scene-graph = { git = "https://github.com/<owner>/Yggdrasil", rev = "<sha>" }
-scene-graph = { path = "../Yggdrasil-master/scene-graph" }
+# Public Yggdrasil, pinned. Bump rev deliberately.
+scene-graph = { git = "https://github.com/brdsdsu/Yggdrasil", rev = "3b17a94c57f366fb30b04f1d939a21559797b2c1" }
 serde_json = "1"
 dsg-convert = { path = "crates/dsg-convert" }

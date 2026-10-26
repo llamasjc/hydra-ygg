@@ -71,9 +71,11 @@ void YggdrasilSink::call(uint64_t timestamp_ns,
 
     const auto stats = impl_->mirror->apply_dsg_json(json);
     ++impl_->updates;
-    std::cerr << "[YggdrasilSink] update " << impl_->updates << " t=" << timestamp_ns
-              << " nodes=" << stats.nodes << " nestings=" << stats.nestings
-              << " import=" << stats.import_us / 1000 << "ms" << std::endl;
+    std::cerr << "[YggdrasilSink] update " << impl_->updates << " nodes=" << stats.nodes << " (+"
+              << stats.nodes_added << " ~" << stats.nodes_updated << " -" << stats.nodes_removed
+              << ") edges(+" << stats.edges_added << " -" << stats.edges_removed << ")"
+              << (stats.rebuilt ? " rebuilt" : "") << " apply=" << stats.apply_us / 1000.0
+              << "ms" << std::endl;
     if (config.compare_every > 0 && impl_->updates % config.compare_every == 0) {
       const auto r = impl_->mirror->compare_with(json, config.tolerance);
       if (r.equal) {

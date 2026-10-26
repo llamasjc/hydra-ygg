@@ -13,6 +13,7 @@
 //!   as a feature on the node and counted, since those are what the port has to redesign.
 
 pub mod compare;
+pub mod incremental;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -38,7 +39,7 @@ pub struct Report {
     pub no_position: usize,
 }
 
-fn key_of(node: &Value) -> LayerKey {
+pub(crate) fn key_of(node: &Value) -> LayerKey {
     (
         node["layer"].as_i64().unwrap(),
         node.get("partition").and_then(Value::as_i64).unwrap_or(0),

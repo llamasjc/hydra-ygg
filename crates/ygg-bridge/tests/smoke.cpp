@@ -24,10 +24,18 @@ int main(int argc, char** argv) {
   auto mirror = hydra_ygg::new_mirror();
   const auto stats = mirror->apply_dsg_json(json);
   const auto r = mirror->compare_with(json, 1e-5);
-  std::cout << "nodes " << stats.nodes << ", nestings " << stats.nestings << ", import "
-            << stats.import_us << " us, max pos err " << r.max_position_error << "\n";
+  std::cout << "nodes " << stats.nodes << ", added " << stats.nodes_added << ", apply "
+            << stats.apply_us << " us, max pos err " << r.max_position_error << "\n";
   if (!r.equal) {
     std::cerr << "mirror differs from input:\n" << std::string(r.summary) << "\n";
+    return 1;
+  }
+  // Applying the same graph again must change nothing.
+  const auto again = mirror->apply_dsg_json(json);
+  if (again.nodes_added + again.nodes_updated + again.nodes_removed + again.edges_added +
+          again.edges_removed !=
+      0) {
+    std::cerr << "re-applying an unchanged graph changed the mirror\n";
     return 1;
   }
   try {

@@ -1,4 +1,5 @@
 // Mirrors Hydra's published backend scene graph into Yggdrasil without touching Hydra.
+// Only what changed since the previous graph is applied to Yggdrasil.
 //
 // Subscribes (through hydra_ros's DsgReceiver) to `dsg`; remap it to /hydra/backend/dsg.
 // Every received graph is written with Hydra's own JSON writer, rebuilt in Yggdrasil, and
@@ -57,9 +58,11 @@ class YggMirrorNode {
 
       const auto stats = mirror_->apply_dsg_json(json);
       ++updates_;
-      std::cerr << "[YggMirror] update " << updates_ << " nodes=" << stats.nodes
-                << " nestings=" << stats.nestings << " import=" << stats.import_us / 1000
-                << "ms" << std::endl;
+      std::cerr << "[YggMirror] update " << updates_ << " nodes=" << stats.nodes << " (+"
+              << stats.nodes_added << " ~" << stats.nodes_updated << " -" << stats.nodes_removed
+              << ") edges(+" << stats.edges_added << " -" << stats.edges_removed << ")"
+              << (stats.rebuilt ? " rebuilt" : "") << " apply=" << stats.apply_us / 1000.0
+              << "ms" << std::endl;
       if (compare_every_ > 0 && updates_ % compare_every_ == 0) {
         const auto r = mirror_->compare_with(json, tolerance_);
         if (r.equal) {

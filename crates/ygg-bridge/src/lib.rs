@@ -1,22 +1,23 @@
 //! C++ entry point for mirroring Hydra's scene graph into Yggdrasil.
 //!
-//! Stage A: every update rebuilds the mirror from Hydra's Spark-DSG JSON. Incremental updates
-//! come later, once the full rebuild is proven equal to Hydra's own output.
+//! Each update is diffed against the previous one and only the changes are applied to Yggdrasil.
 
 use std::time::Instant;
 
-use dsg_convert::{LayerKey, compare::compare};
-use scene_graph::SceneGraph;
+use dsg_convert::compare::compare;
 use serde_json::Value;
 
 #[cxx::bridge(namespace = "hydra_ygg")]
 mod ffi {
     struct UpdateStats {
         nodes: usize,
-        intra_edges: usize,
-        nestings: usize,
-        extra_parent_edges: usize,
-        import_us: u64,
+        nodes_added: usize,
+        nodes_updated: usize,
+        nodes_removed: usize,
+        edges_added: usize,
+        edges_removed: usize,
+        rebuilt: bool,
+        apply_us: u64,
     }
 
     struct CompareResult {
@@ -40,48 +41,36 @@ mod ffi {
     }
 }
 
-#[derive(Default)]
 pub struct Mirror {
-    graph: SceneGraph,
-    layer_keys: std::collections::BTreeMap<LayerKey, u32>,
-    /// Last input, used for header fields on export.
-    header: Value,
+    inner: dsg_convert::incremental::Mirror,
 }
 
 pub fn new_mirror() -> Box<Mirror> {
-    Box::default()
+    Box::new(Mirror {
+        inner: Default::default(),
+    })
 }
 
 impl Mirror {
+    /// Bring the mirror to Hydra's latest graph, changing only what differs from the last one.
     pub fn apply_dsg_json(&mut self, json: &str) -> Result<ffi::UpdateStats, String> {
         let input: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
         let t = Instant::now();
-        let (graph, layer_keys, report) = dsg_convert::import(&input);
-        let import_us = t.elapsed().as_micros() as u64;
-        self.graph = graph;
-        self.layer_keys = layer_keys;
-        let mut header = input;
-        if let Some(h) = header.as_object_mut() {
-            h.remove("nodes");
-            h.remove("edges");
-        }
-        self.header = header;
+        let d = self.inner.apply(&input);
         Ok(ffi::UpdateStats {
-            nodes: report.nodes,
-            intra_edges: report.intra_edges,
-            nestings: report.nestings,
-            extra_parent_edges: report.extra_parent_edges,
-            import_us,
+            nodes: input["nodes"].as_array().map_or(0, Vec::len),
+            nodes_added: d.nodes_added,
+            nodes_updated: d.nodes_updated,
+            nodes_removed: d.nodes_removed,
+            edges_added: d.edges_added,
+            edges_removed: d.edges_removed,
+            rebuilt: d.rebuilt,
+            apply_us: t.elapsed().as_micros() as u64,
         })
     }
 
     pub fn export_value(&self) -> Value {
-        let header = if self.header.is_object() {
-            self.header.clone()
-        } else {
-            Value::Object(Default::default())
-        };
-        dsg_convert::export(&self.graph, &self.layer_keys, &header)
+        self.inner.export()
     }
 
     pub fn export_dsg_json(&self) -> String {
@@ -104,7 +93,7 @@ impl Mirror {
     }
 
     pub fn save(&self, path: &str) -> Result<(), String> {
-        let bytes = serde_json::to_vec(&self.graph).map_err(|e| e.to_string())?;
+        let bytes = serde_json::to_vec(&self.inner.sg).map_err(|e| e.to_string())?;
         std::fs::write(path, bytes).map_err(|e| e.to_string())
     }
 }
@@ -123,7 +112,10 @@ mod tests {
                      {"source":3,"target":1,"info":{"weight":1.0}}]}"#;
         let mut m = new_mirror();
         let stats = m.apply_dsg_json(json).unwrap();
-        assert_eq!((stats.nodes, stats.intra_edges, stats.nestings), (3, 1, 1));
+        assert_eq!(
+            (stats.nodes, stats.nodes_added, stats.edges_added),
+            (3, 3, 2)
+        );
         let r = m.compare_with(json, 1e-5).unwrap();
         assert!(r.equal, "{}", r.summary);
     }

@@ -1,0 +1,26 @@
+diff --git a/include/hydra/backend/graph_store.h b/include/hydra/backend/graph_store.h
+index 16b7c5e..f680a4c 100644
+--- a/include/hydra/backend/graph_store.h
++++ b/include/hydra/backend/graph_store.h
+@@ -17,6 +17,9 @@ struct GraphStore {
+ 
+   virtual ~GraphStore() = default;
+ 
++  //! Called once with the backend graph before any update, e.g. to watch its changes.
++  virtual void attach(spark_dsg::DynamicSceneGraph& graph) = 0;
++
+   //! Store the latest backend graph. Returns the graph that downstream consumers (publishers,
+   //! sinks) should see instead of the spark_dsg one, or nullptr to keep the spark_dsg graph.
+   virtual spark_dsg::DynamicSceneGraph::Ptr store(uint64_t timestamp_ns,
+diff --git a/src/backend/backend_module.cpp b/src/backend/backend_module.cpp
+index 4d66ffe..53c87e6 100644
+--- a/src/backend/backend_module.cpp
++++ b/src/backend/backend_module.cpp
+@@ -137,6 +137,7 @@ BackendModule::BackendModule(const Config& config,
+         << "HYDRA_GRAPH_BACKEND=" << mode
+         << " needs a graph store library, e.g. LD_PRELOAD=.../libhydra_ygg_sink.so";
+     graph_store_ = GraphStore::factory()(mode);
++    graph_store_->attach(*private_dsg_->graph);
+     LOG(WARNING) << "[Hydra Backend] scene graph backend: " << mode;
+   }
+ }

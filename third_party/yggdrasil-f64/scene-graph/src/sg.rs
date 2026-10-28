@@ -1,0 +1,1573 @@
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use spatial_index::{RegionMembershipPredicate, RegionMembershipStatus};
+
+use crate::{
+    AnonNode, Bounds, NodeId, NodeMut,
+    error::{Result, SceneGraphError},
+    fov::Observer,
+    layer::Layer,
+    node::{Coordinate, Edge, Feature, Node},
+    pos::{PosQueryCount, PositionQuery},
+};
+
+/// A hierarchical representation of objects and their relationships in a 3D environment.
+/// The scene graph is organized into layers, where each layer contains nodes representing objects.
+/// The layers together form a DAG Structure, with the top layer representing the root layer
+/// of the scene.
+/// Within each layer, nodes can have edges connecting them to other nodes in the same layer,
+/// forming a graph structure.
+/// Nodes on a layer can also have parent-child relationships with nodes of layers that are
+/// children of the layer they belong to.
+///
+/// The SceneGraph is optimized for executing spatical queries that are used in 3D environments
+/// such as navigation, localization, and mapping.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct SceneGraph {
+    /// Layers of the scene graph, where each layer is either a Semantic or a Physical
+    /// representation of the scene.
+    pub(crate) layers: Vec<Layer>,
+
+    /// Counter to assign unique IDs to nodes.
+    node_counter: u32,
+
+    /// Counter to assign unique IDs to layers.
+    layer_counter: u32,
+}
+
+impl SceneGraph {
+    /// Create a new layer without position indexing and add it to the scene graph.
+    ///
+    /// Consider enabling position indexing if the layer will be frequently queried by `nearest_nodes` or `nodes_within`.
+    ///
+    /// [`nearest_nodes`]: SceneGraph::nearest_nodes
+    /// [`nodes_within`]: SceneGraph::nodes_within
+    pub fn new_layer(&mut self) -> &mut Layer {
+        let lid = self.layer_counter;
+        self.layer_counter += 1;
+        self.layers.push(Layer::new(lid));
+        self.layers.last_mut().unwrap()
+    }
+
+    /// Create a new layer with position indexing enabled and add it to the scene graph.
+    ///
+    /// This allows for efficient spatial queries on node positions.
+    /// Consider enabling position indexing if the layer will be frequently queried by `nearest_nodes` or `nodes_within`.
+    ///
+    /// [`nearest_nodes`]: SceneGraph::nearest_nodes
+    /// [`nodes_within`]: SceneGraph::nodes_within
+    pub fn new_indexed_layer(&mut self) -> &mut Layer {
+        let lid = self.layer_counter;
+        self.layer_counter += 1;
+        self.layers.push(Layer::with_pos_index(lid));
+        self.layers.last_mut().unwrap()
+    }
+
+    /// Get the number of layers in the scene graph.
+    pub fn layers_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Returns an iterator over all layers in the scene graph.
+    pub fn layers(&self) -> impl ExactSizeIterator<Item = &Layer> {
+        self.layers.iter()
+    }
+}
+
+/// SceneGraph Update
+impl SceneGraph {
+    /// Merge another SceneGraph into this one.
+    /// This Process will not delete any nodes or edges, but will apply any change in nodes
+    /// features and/or edges between two nodes that exist in both SceneGraphs.
+    pub fn merge(&mut self, m: SceneGraph) -> Result<()> {
+        for mergee_node in m.layers.iter().flat_map(|l| l.nodes.iter()) {
+            if let Some(pid) = mergee_node.pid {
+                self.nest(mergee_node.id).under(pid)?;
+            }
+        }
+        self.layers
+            .iter_mut()
+            .zip(m.layers)
+            .try_for_each(|(l1, l2)| l1.merge(l2))
+    }
+}
+
+/// Layer Accessors
+impl SceneGraph {
+    /// Get a mutable reference to the top layer.
+    pub fn top_layer_mut(&mut self) -> Result<&mut Layer> {
+        self.layers.last_mut().ok_or(SceneGraphError::LayerNotFound)
+    }
+
+    /// Get an immutable reference to the top layer.
+    pub fn top_layer(&self) -> Result<&Layer> {
+        self.layers.last().ok_or(SceneGraphError::LayerNotFound)
+    }
+
+    /// Get an immutable reference to a layer by its index.
+    pub fn layer(&self, id: u32) -> Result<&Layer> {
+        let layer_index = self
+            .layers
+            .binary_search_by_key(&id, |l| l.id)
+            .or(Err(SceneGraphError::LayerNotFound))?;
+        Ok(&self.layers[layer_index])
+    }
+
+    /// Get a mutable reference to a layer by its index.
+    pub fn layer_mut(&mut self, id: u32) -> Result<&mut Layer> {
+        let layer_index = self
+            .layers
+            .binary_search_by_key(&id, |l| l.id)
+            .or(Err(SceneGraphError::LayerNotFound))?;
+        Ok(&mut self.layers[layer_index])
+    }
+
+    /// Get the layer index of a node by its ID.
+    #[inline]
+    pub fn layer_of(&self, nid: NodeId) -> u32 {
+        nid.layer_id()
+    }
+}
+
+/// Node Accessors
+impl SceneGraph {
+    /// Get an immutable reference to a node by its ID.
+    pub fn node(&self, nid: NodeId) -> Result<&Node> {
+        let lid = nid.layer_id();
+        self.layer(lid)?.node(nid)
+    }
+
+    /// Get a mutable reference to a node by its ID.
+    pub fn node_mut(&mut self, nid: NodeId) -> Result<NodeMut<'_>> {
+        let lid = nid.layer_id();
+        self.layer_mut(lid)?.node_mut(nid)
+    }
+}
+
+/// Node Manipulation
+impl SceneGraph {
+    /// Create a new Metric Node with specified coordinates and features.
+    pub fn new_coordinates(&mut self, x: f64, y: f64, z: f64, features: Vec<Feature>) -> AnonNode {
+        let node = AnonNode::new(
+            self.node_counter,
+            features,
+            vec![Coordinate::new(x, y, z)],
+            false,
+            Some(Bounds::point(Coordinate::new(x, y, z))),
+        );
+        self.node_counter += 1;
+        node
+    }
+
+    /// Create a new Semantic Node with specified features.
+    pub fn new_node(&mut self, features: Vec<Feature>) -> AnonNode {
+        let node = AnonNode::new(self.node_counter, features, Vec::new(), false, None);
+        self.node_counter += 1;
+        node
+    }
+
+    /// Create a new Bounded Semantic Node with specified features.
+    pub fn new_bounded_node(&mut self, features: Vec<Feature>) -> AnonNode {
+        let node = AnonNode::new(
+            self.node_counter,
+            features,
+            Vec::new(),
+            false,
+            Some(Bounds::Unbounded),
+        );
+        self.node_counter += 1;
+        node
+    }
+
+    /// Create a new Indexed Semantic Node with specified features.
+    /// This node will have position indexing enabled and will track of the coordinates of its
+    /// sub-tree for efficient spatial queries.
+    pub fn new_indexed_node(&mut self, features: Vec<Feature>) -> AnonNode {
+        let node = AnonNode::new(
+            self.node_counter,
+            features,
+            Vec::new(),
+            true,
+            Some(Default::default()),
+        );
+        self.node_counter += 1;
+        node
+    }
+
+    /// Delete a node by its ID from the Scene Graph.
+    /// This will also recursively delete all child nodes of the specified node.
+    /// If the node has a parent, it will be removed from the parent's list of children.
+    pub fn del_node(&mut self, nid: NodeId) -> Result<()> {
+        // Remove node from its parent's children list
+        let lid = nid.layer_id();
+        let layer = self.layer_mut(lid)?;
+
+        if let Some(pid) = layer.node(nid)?.pid {
+            self.detach(nid).from(pid)?;
+        }
+
+        // Recursively delete the node and its children
+        fn del_node_recursive(sg: &mut SceneGraph, lid: u32, nid: NodeId) -> Result<()> {
+            let layer = sg.layer_mut(lid)?;
+            let node = layer.del_node(nid)?;
+            for child_id in node.children() {
+                del_node_recursive(sg, child_id.layer_id(), *child_id)?;
+            }
+            Ok(())
+        }
+        del_node_recursive(self, lid, nid)
+    }
+
+    /// Nest a node under another node, establishing a parent-child relationship.
+    /// The `nestee` node will become a child of the `nester` node.
+    /// The `nester` node will have the `nestee` node added to its list of children.
+    /// Both nodes must exist in the scene graph.
+    /// The `nester` node's layer must be the parent layer of the `nestee` node's layer.
+    /// If the `nestee` node already has a parent, it will be removed from its current parent's list of children.
+    ///
+    /// ```rust
+    /// # use scene_graph::SceneGraph;
+    /// # use scene_graph::Result;
+    ///
+    /// # fn main() -> Result<()> {
+    /// # let mut sg = SceneGraph::default();
+    ///
+    /// // Create nodes
+    /// let node1 = sg.new_node(vec![]);
+    /// let node2 = sg.new_node(vec![]);
+    ///
+    /// // Create a layer and add nodes to it
+    /// let lid0 = sg.new_layer().id;
+    /// let layer = sg.new_layer();
+    /// layer.add_child(lid0)?;
+    /// let id1 = sg.layer_mut(0)?.push_node(node1)?;
+    /// let id2 = sg.layer_mut(1)?.push_node(node2)?;
+    ///
+    /// // Nest node1 under node2
+    /// sg.nest(id1).under(id2)?;
+    ///
+    /// assert_eq!(sg.node(id2)?.children(), vec![id1]);
+    /// assert_eq!(sg.node(id1)?.pid, Some(id2));
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn nest(&mut self, nid: NodeId) -> NestUnder<'_> {
+        NestUnder {
+            sg: self,
+            nestee: nid,
+        }
+    }
+
+    /// Detach a node from its parent, removing the parent-child relationship.
+    /// The `nestee` node will become an orphan node on its current layer.
+    /// The `nester` node will have the `nestee` node removed from its list of children.
+    /// Both nodes must exist in the scene graph.
+    /// The function will NoOp if the `nestee` is not nested under `nester` node.
+    ///
+    /// ```rust
+    /// # use scene_graph::SceneGraph;
+    /// # use scene_graph::Result;
+    ///
+    /// # fn main() -> Result<()> {
+    /// # let mut sg = SceneGraph::default();
+    ///
+    /// // Create nodes
+    /// let node1 = sg.new_node(vec![]);
+    /// let node2 = sg.new_node(vec![]);
+    ///
+    /// // Create a layer and add nodes to it
+    /// let lid0 = sg.new_layer().id;
+    /// let layer = sg.new_layer();
+    /// layer.add_child(lid0)?;
+    /// let id1 = sg.layer_mut(0)?.push_node(node1)?;
+    /// let id2 = sg.layer_mut(1)?.push_node(node2)?;
+    ///
+    /// // Nest node1 under node2
+    /// sg.nest(id1).under(id2)?;
+    ///
+    /// assert_eq!(sg.node(id2)?.children(), vec![id1]);
+    /// assert_eq!(sg.node(id1)?.pid, Some(id2));
+    ///
+    /// // Detach node1 from node2
+    /// sg.detach(id1).from(id2)?;
+    /// assert_eq!(sg.node(id2)?.children(), vec![]);
+    /// assert_eq!(sg.node(id1)?.pid, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn detach(&mut self, nid: NodeId) -> DetachFrom<'_> {
+        DetachFrom {
+            sg: self,
+            nestee: nid,
+        }
+    }
+}
+
+/// Query
+impl SceneGraph {
+    /// Get List of all nodes having a specific set of features.
+    pub fn nodes_having(&self, keys: &[&str]) -> Vec<Vec<&Node>> {
+        self.layers.iter().map(|l| l.nodes_having(keys)).collect()
+    }
+
+    /// Get List of all nodes matching a specific set of features.
+    pub fn nodes_matching(&self, features: &[&Feature]) -> Vec<Vec<&Node>> {
+        self.layers
+            .iter()
+            .map(|l| l.nodes_matching(features))
+            .collect()
+    }
+
+    /// Get a list of all nodes in the subtree of the root node that are visible to the observer.
+    /// The check is done using the nodes' coordinates and nodes without coordinates are pruned.
+    ///
+    /// Not to be confused with `visible_subgraph` which returns a sub-scenegraph containing the
+    /// entire visible scene from the observer's prespective, including nodes that nest and/or are
+    /// nested under the visible nodes.
+    ///
+    /// [`visible_subgraph`](SceneGraph::visible_subgraph)
+    pub fn visible_in_subtree(&self, observer: &Observer, root_node_id: NodeId) -> Vec<NodeId> {
+        let mut visible = Vec::new();
+        self.collect_visible(observer, root_node_id, &mut visible);
+
+        // A node may hold many coordinates, and an index yields one hit per coordinate, so the
+        // same node can arrive several times. The contract is "which nodes are visible", so
+        // collapse them. Callers that need *how many* of a node's coordinates are in view read
+        // the node — that count is a property of the node, not of the traversal.
+        visible.sort_unstable();
+        visible.dedup();
+        visible
+    }
+
+    /// Walk the subtree, never opening what the frustum cannot reach.
+    ///
+    /// Two levels of rejection, and they compose:
+    ///
+    /// * **Per node, on its bounds.** A node whose box the observer classifies as
+    ///   [`RegionMembershipStatus::Reject`] contributes nothing, so a single classification
+    ///   replaces the entire walk beneath it. `Bounds::Unbounded` means "has bounds, not yet
+    ///   computable" rather than "empty", so it is not grounds to reject; nor is having no
+    ///   bounds at all. Both fall through.
+    /// * **Inside a position index, per cell.** Where a node carries one, the observer is handed
+    ///   to the kd-tree as a region predicate and pruning happens cell by cell — at bucket
+    ///   granularity rather than all-or-nothing for the subtree.
+    ///
+    /// The alternative is `pos_subtree`, which reads *every* coordinate an indexed node holds
+    /// and leaves the caller to filter. A frustum typically admits a small fraction of a room,
+    /// so that spends nearly all of its time on points it then discards.
+    fn collect_visible(&self, observer: &Observer, nid: NodeId, out: &mut Vec<NodeId>) {
+        let Ok(node) = self.node(nid) else {
+            return;
+        };
+
+        if let Some(Bounds::Bounded(bbox)) = node.bounds {
+            let (lo, hi) = (bbox.min(), bbox.max());
+            if observer.classify(&lo.into(), &hi.into()) == RegionMembershipStatus::Reject {
+                return;
+            }
+        }
+
+        // A node's own coordinates are its own, not the index's: an index holds what was nested
+        // *under* the node. A node counts as visible when any one of its coordinates is, so the
+        // scan can stop at the first hit.
+        if node.coordinates.iter().any(|c| observer.observers(c)) {
+            out.push(node.id);
+        }
+
+        if let Some(pos_index) = &node.pos_index {
+            out.extend(pos_index.members(*observer).map(|(_, id)| id));
+            return;
+        }
+
+        for child in node.children() {
+            self.collect_visible(observer, *child, out);
+        }
+    }
+
+    /// Get a sub-scenegraph of the visible scene from the observer's prespective. The
+    /// sub-scengraph will only contain nodes that are decendents of the root node.
+    ///
+    /// The Visibility is defined as weather the node nests or is nested under another node that
+    /// has a coordinate visible to the observer.
+    pub fn visible_subgraph(&self, observer: &Observer, root_node_id: NodeId) -> Result<Self> {
+        // let coordinates = self.pos_subtree(root_node_id);
+        // let mut coordinates = coordinates
+        //     .iter()
+        //     .filter(|(c, _)| observer.observers(c))
+        //     .collect::<Vec<_>>();
+        //
+        // coordinates.sort_by_key(|(_, a)| a.layer_id());
+        //
+        // let mut queue = VecDeque::new();
+        // queue.extend(coordinates.iter().rev().map(|(_, nid)| *nid));
+        //
+        // let mut layers: HashMap<u32, Vec<NodeId>> = HashMap::new();
+        // while let Some(nid) = queue.pop_front() {
+        //     layers
+        //         .entry(nid.layer_id())
+        //         .and_modify(|v| v.push(nid))
+        //         .or_insert_with(|| vec![nid]);
+        //     if let Some(pnid) = self.node(nid)?.pid {
+        //         queue.push_back(pnid);
+        //     }
+        // }
+        // for (lid, nodes) in layers {}
+        //
+        // let mut subgraph = Self {
+        //     layers: todo!(),
+        //     node_counter: self.node_counter,
+        //     layer_counter: self.layer_counter,
+        // };
+
+        let mut subgraph = self.subgraph(root_node_id)?;
+        if subgraph.layers.is_empty() {
+            return Ok(SceneGraph::default());
+        }
+
+        let mut should_retain_nodes = HashMap::new();
+        for layer in &subgraph.layers {
+            should_retain_nodes.insert(layer.id, HashSet::new());
+        }
+        let mut layers = Vec::new();
+        for layer in &subgraph.layers {
+            let observed = should_retain_nodes.remove(&layer.id).unwrap_or_default();
+            let observed: Vec<_> = layer
+                .observable_nodes(observer)?
+                .nodes
+                .iter()
+                .map(|n| n.id)
+                .chain(observed)
+                .collect();
+            let l = layer.subset(&observed)?;
+            for node in &l.nodes {
+                if let Some(pid) = node.pid {
+                    let parent_layer_id = subgraph.layer_of(pid);
+                    should_retain_nodes
+                        .entry(parent_layer_id)
+                        .and_modify(|nodes| {
+                            nodes.insert(pid);
+                        });
+                }
+            }
+            layers.push(l);
+        }
+
+        subgraph.layers = layers;
+        Ok(subgraph)
+    }
+
+    /// Create a subgraph rooted at the specified node ID.
+    /// The subgraph includes the specified node and all its descendants.
+    /// If the node is not found, an error is returned.
+    pub fn subgraph(&self, root_node_id: NodeId) -> Result<SceneGraph> {
+        let mut subgraph = SceneGraph::default();
+        let root_layer_id = self.layer_of(root_node_id);
+        let mut layers = HashSet::new();
+
+        // BFS to get all layers accissable from root_layer_id downwards
+        let mut layers_queue = VecDeque::new();
+        layers_queue.push_back(root_layer_id);
+        while let Some(layer_id) = layers_queue.pop_front() {
+            let layer = self.layer(layer_id)?;
+            layers.insert(layer_id);
+            for &clid in layer.children.iter() {
+                layers_queue.push_back(clid);
+            }
+        }
+        let mut layers = layers.into_iter().collect::<Vec<u32>>();
+        layers.sort();
+        let mut layers = layers
+            .iter()
+            .map(|&lid| (lid, HashSet::new()))
+            .collect::<Vec<_>>();
+
+        // layers are in topological order from root downwards. so by the time we reach to a layer,
+        // all its parents have been processed.
+        let last_index = layers.len() - 1;
+        layers[last_index].1.insert(root_node_id);
+        let mut new_layers = Vec::new();
+        while let Some((lid, nodes)) = layers.pop() {
+            if nodes.is_empty() {
+                continue;
+            }
+            let layer = self.layer(lid)?;
+            let nodes: Vec<_> = nodes.into_iter().collect();
+            let l = layer.subset(&nodes)?;
+            for nid in nodes {
+                for cid in l.node(nid)?.children() {
+                    let clid = self.layer_of(*cid);
+                    let ptr = layers
+                        .binary_search_by_key(&clid, |(lid, _)| *lid)
+                        .map_err(|_| SceneGraphError::LayerNotFound)?;
+                    layers[ptr].1.insert(*cid);
+                }
+            }
+            new_layers.push(l);
+        }
+        let mut ptr = 0u32;
+
+        while let Some(new_layer) = new_layers.pop()
+            && ptr < self.layers_count() as u32
+        {
+            while ptr < new_layer.id {
+                subgraph.layers.push(Layer::new(ptr));
+                ptr += 1;
+            }
+            subgraph.layers.push(new_layer);
+            ptr += 1;
+        }
+        while ptr < self.layers_count() as u32 {
+            subgraph.layers.push(Layer::new(ptr));
+            ptr += 1;
+        }
+
+        // subgraph.layers.reverse();
+        subgraph.layer_counter = self.layer_counter;
+        subgraph.node_counter = self.node_counter;
+        Ok(subgraph)
+    }
+
+    /// Retrieve at most `count` nearest nodes to the given position.
+    /// The list is sorted by distance from nearest to farthest.
+    /// If this function is called frequently, consider creating the Layer with indexing enabled.
+    ///
+    /// ```rust
+    /// # use scene_graph::SceneGraph;
+    /// # use scene_graph::{Coordinate, PosQueryCount};
+    ///
+    /// let mut sg = SceneGraph::default();
+    ///
+    /// // Create nodes
+    /// let n1 = sg.new_coordinates(0.0, 0.0, 0.0, vec![]);
+    /// let n2 = sg.new_coordinates(1.0, 1.0, 1.0, vec![]);
+    /// let n3 = sg.new_coordinates(2.0, 2.0, 2.0, vec![]);
+    ///
+    /// // Create a layer and add nodes to it
+    /// sg.new_indexed_layer();
+    /// sg.layer_mut(0).unwrap().push_node(n1).unwrap();
+    /// sg.layer_mut(0).unwrap().push_node(n2).unwrap();
+    /// sg.layer_mut(0).unwrap().push_node(n3).unwrap();
+    ///
+    /// let coord = Coordinate::new(0.6, 0.6, 0.6);
+    /// let nearest_nodes = sg.nearest_nodes(&coord, PosQueryCount::Count(2))
+    ///     .into_iter()
+    ///     .map(|(n, d)| (sg.node(n).unwrap(), d))
+    ///     .collect::<Vec<_>>();
+    /// assert_eq!(nearest_nodes.len(), 2);
+    /// assert_eq!(nearest_nodes[0].0.coordinates[0], Coordinate::new(1.0, 1.0, 1.0));
+    /// assert_eq!(nearest_nodes[1].0.coordinates[0], Coordinate::new(0.0, 0.0, 0.0));
+    /// ```
+    pub fn nearest_nodes(&self, coord: &Coordinate, count: PosQueryCount) -> Vec<(NodeId, f64)> {
+        let mut distances = self
+            .layers
+            .iter()
+            .flat_map(|l| l.nearest_nodes(coord, count))
+            .collect::<Vec<_>>();
+        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let distances_max_len = distances.len();
+        distances
+            .into_iter()
+            .take(count.capped_with(distances_max_len))
+            .collect()
+    }
+
+    /// Retrieve at most `count` nodes within a specified radius to the given position.
+    /// If this function is called frequently, consider creating the Layer with indexing enabled.
+    /// ```rust
+    ///
+    /// # use scene_graph::SceneGraph;
+    /// # use scene_graph::{Coordinate, PosQueryCount};
+    ///
+    /// let mut sg = SceneGraph::default();
+    ///
+    /// // Create nodes
+    /// let n1 = sg.new_coordinates(0.0, 0.0, 0.0, vec![]);
+    /// let n2 = sg.new_coordinates(1.0, 1.0, 1.0, vec![]);
+    /// let n3 = sg.new_coordinates(2.0, 2.0, 2.0, vec![]);
+    ///
+    /// // Create a layer and add nodes to it
+    /// sg.new_indexed_layer();
+    /// sg.layer_mut(0).unwrap().push_node(n1).unwrap();
+    /// sg.layer_mut(0).unwrap().push_node(n2).unwrap();
+    /// sg.layer_mut(0).unwrap().push_node(n3).unwrap();
+    ///
+    /// let coord = Coordinate::new(0.3, 0.3, 0.3);
+    /// let nodes_within_radius = sg.nodes_within(&coord, 2.0, PosQueryCount::All)
+    ///     .into_iter()
+    ///     .map(|(n, d)| (sg.node(n).unwrap(), d))
+    ///     .collect::<Vec<_>>();
+    /// assert_eq!(nodes_within_radius.len(), 2);
+    /// assert!(nodes_within_radius.iter().any(|n| n.0.coordinates[0] == Coordinate::new(0.0, 0.0, 0.0)));
+    /// assert!(nodes_within_radius.iter().any(|n| n.0.coordinates[0] == Coordinate::new(1.0, 1.0, 1.0)));
+    /// ```
+    pub fn nodes_within(
+        &self,
+        coord: &Coordinate,
+        radius: f64,
+        count: PosQueryCount,
+    ) -> Vec<(NodeId, f64)> {
+        let mut distances = self
+            .layers
+            .iter()
+            .flat_map(|l| l.nodes_within(coord, radius, count))
+            .collect::<Vec<_>>();
+        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let count = count.capped_with(distances.len());
+        distances.into_iter().take(count).collect()
+    }
+
+    /// Retrieve at most `count` nearest nodes to the given position within the sub-tree rooted at the specified node ID.
+    /// If this function is called frequently, consider creating the Node with indexing enabled.
+    /// ```rust
+    ///
+    /// # use scene_graph::SceneGraph;
+    /// # use scene_graph::{Coordinate, PosQueryCount};
+    /// # use scene_graph::Result;
+    ///
+    /// # fn main() -> Result<()> {
+    /// let mut sg = SceneGraph::default();
+    ///
+    /// // Create nodes
+    /// let n1 = sg.new_coordinates(0.0, 0.0, 0.0, vec![]);
+    /// let n2 = sg.new_coordinates(1.0, 1.0, 1.0, vec![]);
+    /// let n3 = sg.new_coordinates(2.0, 2.0, 2.0, vec![]);
+    ///
+    /// // Create a layer and add nodes to it
+    /// let first_layer_id = sg.new_indexed_layer().id;
+    /// let n1_id = sg.layer_mut(0)?.push_node(n1)?;
+    /// let n2_id = sg.layer_mut(0)?.push_node(n2)?;
+    /// let n3_id = sg.layer_mut(0)?.push_node(n3)?;
+    ///
+    /// // create new semantic layer and nest all nodes under a new parent node
+    /// let semantic_layer = sg.new_layer();
+    /// semantic_layer.add_child(first_layer_id)?;
+    /// let parent_node = sg.new_indexed_node(vec![]);
+    /// let pid = sg.top_layer_mut()?.push_node(parent_node)?;
+    /// sg.nest(n1_id).under(pid)?;
+    /// sg.nest(n2_id).under(pid)?;
+    /// sg.nest(n3_id).under(pid)?;
+    ///
+    /// let coord = Coordinate::new(0.6, 0.6, 0.6);
+    /// let nearest_in_subtree = sg.nearest_in_subtree(&coord, pid, PosQueryCount::Count(2))?
+    ///     .into_iter()
+    ///     .map(|(n, d)| (sg.node(n).unwrap(), d))
+    ///     .collect::<Vec<_>>();
+    /// assert_eq!(nearest_in_subtree.len(), 2);
+    /// assert_eq!(nearest_in_subtree[0].0.coordinates[0], Coordinate::new(1.0, 1.0, 1.0));
+    /// assert_eq!(nearest_in_subtree[1].0.coordinates[0], Coordinate::new(0.0, 0.0, 0.0));
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn nearest_in_subtree(
+        &self,
+        coord: &Coordinate,
+        root: NodeId,
+        count: PosQueryCount,
+    ) -> Result<Vec<(NodeId, f64)>> {
+        Ok(match &self.node(root)?.pos_index {
+            Some(pos_index) => pos_index.nearest_nodes(coord, count),
+            None => self.pos_subtree(root).nearest_nodes(coord, count),
+        })
+    }
+
+    /// Get List of all edges matching a specific description.
+    pub fn edges_matching(&self, desc: &str) -> Vec<Vec<&Edge>> {
+        self.layers.iter().map(|l| l.edges_matching(desc)).collect()
+    }
+
+    /// Get List of all edges from a specific source node.
+    pub fn edges_from(&self, src: NodeId) -> Vec<&Edge> {
+        match self.node(src) {
+            Ok(n) => n.edges.iter().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Get List of all edges to a specific destination node.
+    pub fn edges_to(&self, dst: NodeId) -> Vec<&Edge> {
+        self.layers.iter().flat_map(|l| l.edges_to(dst)).collect()
+    }
+}
+
+impl SceneGraph {
+    /// Get list of all coordinates in the sub-tree rooted at the specified node ID.
+    fn pos_subtree(&self, root: NodeId) -> Vec<(Coordinate, NodeId)> {
+        let mut coords = Vec::new();
+        let node = match self.node(root) {
+            Ok(n) => n,
+            Err(_) => return coords,
+        };
+        for c in &node.coordinates {
+            coords.push((*c, node.id));
+        }
+        if let Some(pos_index) = &node.pos_index {
+            coords.extend(pos_index.iter().map(|(id, c)| (Coordinate::from(c), id)));
+            return coords;
+        }
+        for cid in node.children() {
+            coords.extend(self.pos_subtree(*cid));
+        }
+        coords
+    }
+
+    /// Get an unsynced mutable reference to the Node, preventing syncronization between the
+    /// `Layer` and the `Node`.
+    ///
+    /// # SAFETY
+    /// This function is unsafe because it allows modification of the Node without updating
+    /// the Layer's position index. The caller must ensure that any changes to the Node's
+    /// coordinates are properly reflected in the Layer's position index to maintain consistency.
+    /// Get a mutable reference to a node by its ID.
+    unsafe fn node_mut_unsynced(&mut self, id: NodeId) -> Result<&mut Node> {
+        self.layers
+            .iter_mut()
+            .find_map(|layer| unsafe { layer.node_mut_unsynced(id) }.ok())
+            .ok_or(SceneGraphError::NodeNotFound)
+    }
+
+    fn bounds_of(&self, nid: NodeId) -> Result<Bounds> {
+        let node = self.node(nid)?;
+        if let Some(bounds) = node.bounds {
+            Ok(bounds)
+        } else {
+            self.build_bounds(nid)
+        }
+    }
+
+    fn build_bounds(&self, nid: NodeId) -> Result<Bounds> {
+        let node = self.node(nid)?;
+        let coordinate_bounds = Bounds::of(&node.coordinates);
+        let bounds = node
+            .children()
+            .iter()
+            .map(|&cid| self.bounds_of(cid))
+            .filter_map(Result::ok)
+            .fold(coordinate_bounds, |mut acc, b| *acc.merge(&b));
+
+        Ok(bounds)
+    }
+
+    /// Propagate the deletion of points in the child subtree to the parent node and all the way up
+    /// to the root.
+    fn bubble_up_points_removal(
+        &mut self,
+        pid: NodeId,
+        pos_subtree: Vec<(glam::DVec3, NodeId)>,
+    ) -> Result<()> {
+        // SAFETY: Operations done on the parent:
+        // 1. Removal of points from it's index
+        //
+        // So no layer-level logic is violated
+        let parent = unsafe { self.node_mut_unsynced(pid)? };
+
+        if let Some(pos_index) = parent.pos_index.as_mut() {
+            for (c, nid) in &pos_subtree {
+                pos_index.remove(&(*c).into(), *nid);
+            }
+        }
+
+        match self.node(pid)?.pid {
+            Some(ppid) => self.bubble_up_points_removal(ppid, pos_subtree),
+            None => Ok(()),
+        }
+    }
+
+    /// Propagate the deletion of a cihld node's bounds to the parent node and all the way up to
+    /// the root.
+    ///
+    /// Invariantes:
+    /// - This function should only be called when the child node is removed from the parent's
+    ///   subtree since it might try to rebuild the bounds using the subtree.
+    fn bubble_up_bounds_removal(&mut self, pid: NodeId, deleted: Bounds) -> Result<()> {
+        match deleted {
+            Bounds::Unbounded => Ok(()),
+            Bounds::Bounded(_) => {
+                if let Some(bounds) = self.node(pid)?.bounds {
+                    if bounds.shares_border_with(&deleted) {
+                        let new_bounds = self.build_bounds(pid)?;
+                        unsafe {
+                            // SAFETY: Operations done on the parent:
+                            // 1. Updating the bounds of the parent if it exists
+                            //
+                            // So no layer-level logic is violated
+                            let parent = self.node_mut_unsynced(pid)?;
+                            parent.bounds = Some(new_bounds);
+                        }
+                    } else {
+                        // If the deleted bounds do not share a border with the parent's bounds,
+                        // then the parent's bounds are not affected and we can cease the
+                        // propagation.
+                        return Ok(());
+                    }
+                }
+
+                // propagate the new bounds to the ancestors if available
+                match self.node(pid)?.pid {
+                    Some(ppid) => self.bubble_up_bounds_removal(ppid, deleted),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// Propagate the new positions of the child subtree to the parent node and all the way up to
+    /// the root.
+    fn bubble_up_points_addition(
+        &mut self,
+        parent: NodeId,
+        pos: Vec<(glam::DVec3, NodeId)>,
+    ) -> Result<()> {
+        // SAFETY: Operations done to the nester node:
+        // 1. Update position index with the new child subtree
+        //
+        // So no layer-level logic is violated
+        let node = unsafe { self.node_mut_unsynced(parent)? };
+        if let Some(pos_index) = node.pos_index.as_mut() {
+            for (coords, id) in pos.iter() {
+                pos_index
+                    .add_rebalancing(&(*coords).into(), *id)
+                    .map_err(|e| SceneGraphError::PosIndexInsertion(e.to_string()))?;
+            }
+        }
+
+        match node.pid {
+            Some(pid) => self.bubble_up_points_addition(pid, pos),
+            None => Ok(()),
+        }
+    }
+
+    /// Propagate the new bounds of the child to the parent node and all the way up to the root.
+    fn bubble_up_bounds_addition(&mut self, parent: NodeId, new_bounds: Bounds) -> Result<()> {
+        match new_bounds {
+            Bounds::Unbounded => Ok(()),
+            Bounds::Bounded(_) => {
+                // SAFETY: Operations done to the nester node:
+                // 1. Update bounds with the new child
+                //
+                // So no layer-level logic is violated
+                let node = unsafe { self.node_mut_unsynced(parent)? };
+
+                if let Some(node_bounds) = node.bounds.as_mut() {
+                    // If the new bounds are already encompassed by the node's bounds, we can stop
+                    // the propagation since the ancestors' bounds will also encompass the new
+                    // bounds.
+                    if node_bounds.encompasses(&new_bounds) {
+                        return Ok(());
+                    }
+                    node_bounds.merge(&new_bounds);
+                }
+
+                match node.pid {
+                    Some(pid) => self.bubble_up_bounds_addition(pid, new_bounds),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+}
+
+/// An intermediate struct to facilitate the nesting of one node under another in a SceneGraph.
+/// Refer to the `nest` method in `SceneGraph` for usage example.
+///
+/// [`nest`](SceneGraph::nest)
+pub struct NestUnder<'a> {
+    sg: &'a mut SceneGraph,
+    nestee: NodeId,
+}
+
+impl<'a> NestUnder<'a> {
+    /// Complete the nesting operation by specifying the `nester` node under which the `nestee` node
+    /// Refer to the `nest` method in `SceneGraph` for usage example.
+    ///
+    /// [`nest`](SceneGraph::nest)
+    pub fn under(&mut self, nester: NodeId) -> Result<&mut SceneGraph> {
+        let nester_layer_id = self.sg.layer_of(nester);
+        let nestee_layer_id = self.sg.layer_of(self.nestee);
+        let nester_layer = self.sg.layer(nester_layer_id)?;
+        if !nester_layer.children.contains(&nestee_layer_id) {
+            return Err(SceneGraphError::InvalidLayersForNesting(
+                nestee_layer_id,
+                nester_layer_id,
+            ));
+        }
+
+        let nestee = unsafe { self.sg.node_mut_unsynced(self.nestee)? };
+        match nestee.pid {
+            // Remove from old parent
+            Some(parent_id) => {
+                nestee.pid = Some(nester);
+                self.sg.node_mut(parent_id)?.remove_child(self.nestee)?;
+            }
+            None => {
+                nestee.pid = Some(nester);
+            }
+        }
+
+        // SAFETY: Operations done to the nester node:
+        // 1. Adding a new child to it's children list
+        // 2. Update position index with the new child subtree
+        let node = unsafe { self.sg.node_mut_unsynced(nester)? };
+        node.add_child(self.nestee);
+
+        // propagete the new positions to the nester and all its ancestors with position index enabled.
+        self.sg
+            .bubble_up_points_addition(nester, self.sg.pos_subtree(self.nestee))?;
+
+        // propagate the new bounds to the nester and all its ancestors.
+        self.sg
+            .bubble_up_bounds_addition(nester, self.sg.bounds_of(self.nestee)?)?;
+
+        Ok(self.sg)
+    }
+}
+
+/// An intermediate struct to facilitate the Detaching of one node from another in a SceneGraph.
+/// Refer to the `detach` method in `SceneGraph` for usage example.
+///
+/// [`detach`](SceneGraph::detach)
+pub struct DetachFrom<'a> {
+    sg: &'a mut SceneGraph,
+    nestee: NodeId,
+}
+
+impl<'a> DetachFrom<'a> {
+    /// Complete the detaching operation by specifying the `nester` node under which the `nestee` node
+    /// is currently nested.
+    /// Refer to the `nest` method in `SceneGraph` for usage example.
+    ///
+    /// [`detach`](SceneGraph::detach)
+    pub fn from(&mut self, nester: NodeId) -> Result<&mut SceneGraph> {
+        let nester_layer_id = self.sg.layer_of(nester);
+        let nestee_layer_id = self.sg.layer_of(self.nestee);
+        let nester_layer = self.sg.layer(nester_layer_id)?;
+
+        // NoOp if the nestee is not nested under nester
+        if !nester_layer.children.contains(&nestee_layer_id) {
+            return Ok(self.sg);
+        }
+        if !self.sg.node(nester)?.children().contains(&self.nestee) {
+            return Ok(self.sg);
+        }
+
+        // propagate the removal of points in the child subtree to the nester and all its
+        // ancestors.
+        self.sg
+            .bubble_up_points_removal(nester, self.sg.pos_subtree(self.nestee))?;
+
+        // SAFETY: Operations done to the nester node:
+        // 1. Removing a child from it's children list
+        //
+        // So no layer-level logic is violated
+        unsafe { self.sg.node_mut_unsynced(nester) }?.remove_child(self.nestee)?;
+
+        // propagate the removal of the child node's bounds to the nester and all its ancestors.
+        self.sg
+            .bubble_up_bounds_removal(nester, self.sg.bounds_of(self.nestee)?)?;
+
+        // SAFETY: Operations done on the child node:
+        // 1. Setting parent pointer to None
+        //
+        // So no layer-level logic is violated
+        unsafe { self.sg.node_mut_unsynced(self.nestee) }?.pid = None;
+
+        Ok(self.sg)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[test]
+    fn subgraph() -> Result<()> {
+        // creating a scene graph with 3 layers, with the following structure:
+        // layers structure:
+        // Layer 2
+        //   ├── Layer 1
+        //   └────└── Layer 0
+        //
+        // Nodes structure:
+        // n2
+        // ├── n1
+        // └────── n0
+        // m2
+        // ├── m1
+        // └────── m0
+        let mut sg = SceneGraph::default();
+        sg.new_layer();
+        sg.new_layer();
+        sg.new_layer();
+
+        sg.top_layer_mut()?.add_child(0)?;
+        sg.top_layer_mut()?.add_child(1)?;
+        sg.layer_mut(1)?.add_child(0)?;
+
+        let n0 = sg.new_node(vec![Feature::new("name", "n0")]);
+        let n1 = sg.new_node(vec![Feature::new("name", "n1")]);
+        let n2 = sg.new_node(vec![Feature::new("name", "n2")]);
+
+        let m0 = sg.new_node(vec![Feature::new("name", "m0")]);
+        let m1 = sg.new_node(vec![Feature::new("name", "m1")]);
+        let m2 = sg.new_node(vec![Feature::new("name", "m2")]);
+
+        let n0 = sg.layer_mut(0)?.push_node(n0)?;
+        let n1 = sg.layer_mut(1)?.push_node(n1)?;
+        let n2 = sg.layer_mut(2)?.push_node(n2)?;
+
+        let m0 = sg.layer_mut(0)?.push_node(m0)?;
+        let m1 = sg.layer_mut(1)?.push_node(m1)?;
+        let m2 = sg.layer_mut(2)?.push_node(m2)?;
+
+        sg.nest(n0).under(n2)?;
+        sg.nest(n1).under(n2)?;
+
+        sg.nest(m0).under(m2)?;
+        sg.nest(m1).under(m2)?;
+
+        // subgraph for n2 should only contain n2, n1, n0
+        let subgraph_n2 = sg.subgraph(n2)?;
+        assert_eq!(subgraph_n2.layers.len(), 3);
+        assert_eq!(subgraph_n2.layer(0)?.nodes.len(), 1);
+        assert_eq!(subgraph_n2.layer(1)?.nodes.len(), 1);
+        assert_eq!(subgraph_n2.layer(2)?.nodes.len(), 1);
+        assert_eq!(subgraph_n2.node(n2)?.features[0].value(), "n2");
+        assert_eq!(subgraph_n2.node(n1)?.features[0].value(), "n1");
+        assert_eq!(subgraph_n2.node(n0)?.features[0].value(), "n0");
+
+        // subgraph for m1 should only contain m1
+        let subgraph_m1 = sg.subgraph(m1)?;
+        // subgraph will retain all layers, though only layer 1 will have nodes in it.
+        assert_eq!(subgraph_m1.layers.len(), 3);
+        assert_eq!(subgraph_m1.layer(1)?.nodes.len(), 1);
+        assert_eq!(subgraph_m1.node(m1)?.features[0].value(), "m1");
+        assert_eq!(subgraph_m1.layer(1)?.id, sg.layer_of(m1));
+        // there should be no nodes in other layers
+        assert_eq!(subgraph_m1.layer(0)?.nodes.len(), 0);
+        assert_eq!(subgraph_m1.layer(2)?.nodes.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn del_node_index_propagation() -> Result<()> {
+        // creating a scene graph with 2 layers, with the following structure:
+        // layers structure:
+        // Layer 1
+        // └── Layer 0
+        // Nodes structure:
+        // m0
+        // ├── n0 ...
+        // └── n10
+        //
+        // each node in layer 0 has 10 coordinates, namely, (i,i,i) for the i'th node.
+        //
+        // Scenario:
+        // we first check if nearest neighbor query on n0 coordinates returns the n0's
+        // coordinates when run on m0; then we delete n0 and repeate the same query, which should
+        // not return n0's coordinates anymore.
+
+        // 1. creating the scene graph
+        let mut sg = SceneGraph::default();
+        sg.new_layer();
+        sg.new_layer();
+        sg.layer_mut(1)?.add_child(0)?;
+        let m0 = sg.new_indexed_node(vec![Feature::new("name", "m0")]);
+        let m0_id = sg.layer_mut(1)?.push_node(m0)?;
+        for i in 0..10 {
+            let mut n = sg.new_indexed_node(vec![Feature::new("name", format!("n{i}"))]);
+            n.coordinates = vec![Coordinate::new(i as f64, i as f64, i as f64)];
+            let n_id = sg.layer_mut(0)?.push_node(n)?;
+            sg.nest(n_id).under(m0_id)?;
+        }
+
+        // 2. nearest neighbor query on n0's coordinates should return n0
+        let query_coord = Coordinate::new(0.0, 0.0, 0.0);
+        let nearest = sg.nearest_in_subtree(&query_coord, m0_id, PosQueryCount::Count(1))?;
+        assert_eq!(nearest.len(), 1);
+        assert_eq!(
+            sg.node(nearest[0].0)?.coordinates[0],
+            Coordinate::new(0.0, 0.0, 0.0)
+        );
+
+        // 3. delete n0 and repeat the same query, which should not return n0's coordinates anymore
+        let n0_id = sg.nodes_matching(&[&Feature::new("name", "n0")])[0][0].id;
+        sg.del_node(n0_id)?;
+        let nearest_after_deletion =
+            sg.nearest_in_subtree(&query_coord, m0_id, PosQueryCount::Count(1))?;
+        assert_eq!(nearest_after_deletion.len(), 1);
+        assert_ne!(
+            sg.node(nearest_after_deletion[0].0)?.coordinates[0],
+            Coordinate::new(0.0, 0.0, 0.0)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn nearest_in_subtree_unindexed_matches_indexed() -> Result<()> {
+        // layers structure:          nodes structure:
+        // Layer 1 (semantic)         indexed_root      plain_root
+        // └── Layer 0 (points)       ├── (3,0,0)       ├── (3,0,0)
+        //                            └── (4,0,0)       └── (4,0,0)
+        let mut sg = SceneGraph::default();
+        sg.new_layer();
+        sg.new_layer();
+        sg.layer_mut(1)?.add_child(0)?;
+
+        let indexed_root = sg.new_indexed_node(vec![Feature::new("name", "indexed")]);
+        let indexed_root = sg.layer_mut(1)?.push_node(indexed_root)?;
+        let plain_root = sg.new_node(vec![Feature::new("name", "plain")]);
+        let plain_root = sg.layer_mut(1)?.push_node(plain_root)?;
+
+        // A node may have only one parent, so each root gets its own copy of the points.
+        for root in [indexed_root, plain_root] {
+            for x in [3.0, 4.0] {
+                let p = sg.new_coordinates(x, 0.0, 0.0, vec![]);
+                let p = sg.layer_mut(0)?.push_node(p)?;
+                sg.nest(p).under(root)?;
+            }
+        }
+
+        let query = Coordinate::ZERO;
+        for count in [PosQueryCount::Count(2), PosQueryCount::All] {
+            let from_indexed = sg
+                .nearest_in_subtree(&query, indexed_root, count)?
+                .iter()
+                .map(|(_, d)| *d)
+                .collect::<Vec<_>>();
+            let from_plain = sg
+                .nearest_in_subtree(&query, plain_root, count)?
+                .iter()
+                .map(|(_, d)| *d)
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                from_indexed,
+                vec![3.0, 4.0],
+                "indexed root returned wrong distances for {count:?}"
+            );
+            assert_eq!(
+                from_plain, from_indexed,
+                "nearest_in_subtree({count:?}) disagrees between an indexed and a \
+                 non-indexed root: {from_plain:?} vs {from_indexed:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn del_node() -> Result<()> {
+        // Block-allocated layer ids, two rooms side by side. Note that the child of an
+        // `objects` layer is *not* at `objects_layer_id - 1`:
+        //
+        // Layer 4 (rooms)
+        // ├── Layer 2 (objects, room a) ── Layer 0 (points, room a)
+        // └── Layer 3 (objects, room b) ── Layer 1 (points, room b)
+        let mut sg = SceneGraph::default();
+        for _ in 0..5 {
+            sg.new_layer();
+        }
+        let (points_a, points_b, objects_a, objects_b, rooms) = (0, 1, 2, 3, 4);
+        sg.layer_mut(objects_a)?.add_child(points_a)?;
+        sg.layer_mut(objects_b)?.add_child(points_b)?;
+        sg.layer_mut(rooms)?.add_child(objects_a)?;
+        sg.layer_mut(rooms)?.add_child(objects_b)?;
+
+        // Build one room per branch, so deleting room a must leave room b untouched.
+        let mut built = Vec::new();
+        for (name, objects, points) in [("a", objects_a, points_a), ("b", objects_b, points_b)] {
+            let room = sg.new_node(vec![Feature::new("name", format!("room_{name}"))]);
+            let room = sg.layer_mut(rooms)?.push_node(room)?;
+            let object = sg.new_node(vec![Feature::new("name", format!("object_{name}"))]);
+            let object = sg.layer_mut(objects)?.push_node(object)?;
+            let point = sg.new_coordinates(1.0, 2.0, 3.0, vec![]);
+            let point = sg.layer_mut(points)?.push_node(point)?;
+            sg.nest(point).under(object)?;
+            sg.nest(object).under(room)?;
+            built.push((room, object, point));
+        }
+        let (room_a, object_a, point_a) = built[0];
+        let (room_b, object_b, point_b) = built[1];
+
+        if let Err(e) = sg.del_node(room_a) {
+            panic!(
+                "del_node(room_a) failed with {e:?}: the cascade recurses into \
+                 `layer_id - 1` rather than each child's own layer, so it looked for \
+                 room a's object (on layer {objects_a}) in layer {}",
+                rooms - 1
+            );
+        }
+
+        // Room a's whole subtree is gone, across all three of its layers.
+        assert!(sg.node(room_a).is_err(), "room a should have been deleted");
+        assert!(
+            sg.node(object_a).is_err(),
+            "object a should have been cascade-deleted"
+        );
+        assert!(
+            sg.node(point_a).is_err(),
+            "point a should have been cascade-deleted"
+        );
+
+        // Room b is on the sibling branch and must be entirely untouched.
+        assert!(sg.node(room_b).is_ok(), "room b should have survived");
+        assert!(sg.node(object_b).is_ok(), "object b should have survived");
+        assert!(sg.node(point_b).is_ok(), "point b should have survived");
+        assert_eq!(sg.layer(points_b)?.nodes.len(), 1);
+        assert_eq!(sg.layer(objects_b)?.nodes.len(), 1);
+
+        Ok(())
+    }
+
+    /// An observer at the origin looking along `+Z`: half-angle 35°, near 0.6, far 6.0.
+    fn cone() -> Observer {
+        Observer::new_looking_along(
+            Coordinate::ZERO,
+            Coordinate::Z,
+            35_f64.to_radians(),
+            0.6,
+            6.0,
+        )
+        .unwrap()
+    }
+
+    /// On the viewing axis, between the near and far planes.
+    const IN_VIEW: Coordinate = Coordinate::new(0.0, 0.0, 1.0);
+
+    /// Off the axis but still inside the cone, so the two in-view constants are distinct
+    /// points rather than duplicates.
+    const ALSO_IN_VIEW: Coordinate = Coordinate::new(0.5, 0.2, 2.0);
+
+    /// Within near/far range, but 90° off the viewing axis: rejected on angle.
+    const OFF_AXIS: Coordinate = Coordinate::new(5.0, 0.0, 0.0);
+
+    /// On the axis, but nearer than the near plane: rejected on range.
+    const TOO_NEAR: Coordinate = Coordinate::new(0.0, 0.0, 0.3);
+
+    /// On the axis, but past the far plane: rejected on range.
+    const TOO_FAR: Coordinate = Coordinate::new(0.0, 0.0, 10.0);
+
+    /// Push a node carrying `at` onto layer `lid`.
+    fn push_at(sg: &mut SceneGraph, lid: u32, at: Coordinate) -> Result<NodeId> {
+        let node = sg.new_coordinates(at.x, at.y, at.z, vec![]);
+        sg.layer_mut(lid)?.push_node(node)
+    }
+
+    /// `visible_in_subtree` yields ids in traversal order, and in kd-tree order for an
+    /// indexed root, so every comparison against it has to be order-insensitive.
+    fn sorted(mut ids: Vec<NodeId>) -> Vec<NodeId> {
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn visible_in_subtree_collects_every_visible_node_in_the_subtree() -> Result<()> {
+        // Layer 2 (rooms) ── Layer 1 (objects) ── Layer 0 (points)
+        //
+        // root (in view)
+        // ├── near_object (in view)
+        // │   ├── (in view)
+        // │   └── (too far)
+        // └── far_object (off axis)
+        //     ├── (in view)
+        //     └── (too near)
+        //
+        // Visibility is judged per node: an invisible parent does not hide a visible
+        // child, and a visible parent does not drag an invisible child along with it.
+        let mut sg = SceneGraph::default();
+        for _ in 0..3 {
+            sg.new_layer();
+        }
+        sg.layer_mut(1)?.add_child(0)?;
+        sg.layer_mut(2)?.add_child(1)?;
+
+        let root = push_at(&mut sg, 2, IN_VIEW)?;
+        let mut expected = vec![root];
+
+        for (object_at, points) in [
+            (IN_VIEW, [ALSO_IN_VIEW, TOO_FAR]),
+            (OFF_AXIS, [ALSO_IN_VIEW, TOO_NEAR]),
+        ] {
+            let object = push_at(&mut sg, 1, object_at)?;
+            sg.nest(object).under(root)?;
+            if object_at == IN_VIEW {
+                expected.push(object);
+            }
+
+            for point_at in points {
+                let point = push_at(&mut sg, 0, point_at)?;
+                sg.nest(point).under(object)?;
+                if point_at == ALSO_IN_VIEW {
+                    expected.push(point);
+                }
+            }
+        }
+
+        assert_eq!(
+            sorted(sg.visible_in_subtree(&cone(), root)),
+            sorted(expected),
+            "expected the root, the in-view object, and the in-view point under each \
+             object regardless of whether that object was itself visible"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn visible_in_subtree_skips_nodes_without_coordinates() -> Result<()> {
+        // Layer 1 (semantic) ── Layer 0 (points)
+        //
+        // semantic_root (no coordinates)
+        // └── point (in view)
+        //
+        // A node with no coordinate can never be visible, but it must not hide the
+        // visible points nested beneath it either.
+        let mut sg = SceneGraph::default();
+        sg.new_layer();
+        sg.new_layer();
+        sg.layer_mut(1)?.add_child(0)?;
+
+        let root = sg.new_node(vec![Feature::new("name", "semantic")]);
+        let root = sg.layer_mut(1)?.push_node(root)?;
+        let point = push_at(&mut sg, 0, IN_VIEW)?;
+        sg.nest(point).under(root)?;
+
+        assert_eq!(
+            sg.visible_in_subtree(&cone(), root),
+            vec![point],
+            "the coordinate-less root should be pruned but its visible child kept"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn visible_in_subtree_ignores_nodes_outside_the_subtree() -> Result<()> {
+        // Layer 1 (objects) ── Layer 0 (points)
+        //
+        // object_a            object_b
+        // └── a (in view)     └── b (in view)
+        //
+        // Both points are visible, but a query rooted at one object must not report the
+        // other's, however visible it is.
+        let mut sg = SceneGraph::default();
+        sg.new_layer();
+        sg.new_layer();
+        sg.layer_mut(1)?.add_child(0)?;
+
+        let mut branches = Vec::new();
+        for _ in 0..2 {
+            let object = sg.new_node(vec![]);
+            let object = sg.layer_mut(1)?.push_node(object)?;
+            let point = push_at(&mut sg, 0, IN_VIEW)?;
+            sg.nest(point).under(object)?;
+            branches.push((object, point));
+        }
+        let [(object_a, point_a), (object_b, point_b)] = branches[..] else {
+            unreachable!("two branches were just built")
+        };
+
+        assert_eq!(sg.visible_in_subtree(&cone(), object_a), vec![point_a]);
+        assert_eq!(sg.visible_in_subtree(&cone(), object_b), vec![point_b]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn visible_in_subtree_of_an_unknown_node_is_empty() -> Result<()> {
+        // The query hands back a plain Vec rather than a Result, so a root it cannot
+        // resolve has to come back empty instead of panicking.
+        let mut sg = SceneGraph::default();
+        sg.new_layer();
+        let point = push_at(&mut sg, 0, IN_VIEW)?;
+
+        // A leaf is a valid subtree root, and reports itself.
+        assert_eq!(sg.visible_in_subtree(&cone(), point), vec![point]);
+        // An id on a real layer that was never pushed.
+        assert!(
+            sg.visible_in_subtree(&cone(), NodeId::new(999, 0))
+                .is_empty()
+        );
+        // An id on a layer that does not exist at all.
+        assert!(sg.visible_in_subtree(&cone(), NodeId::new(0, 7)).is_empty());
+
+        Ok(())
+    }
+
+    /// Rejecting a subtree on its root's bounds must not change the answer, only the work.
+    ///
+    /// The bounds test is conservative, so the only failure it can produce is *dropping*
+    /// visible nodes — and a query that silently returns fewer results is exactly what nothing
+    /// downstream would catch. So this compares against the answer computed without any
+    /// pruning, over enough poses that a cone has to sweep across the subtree's box: some
+    /// wholly outside it, some wholly inside, and many crossing its faces and corners.
+    #[test]
+    fn bounds_rejection_does_agrees_with_visible_in_subtree() -> Result<()> {
+
+        let mut sg = SceneGraph::default();
+        sg.new_layer();
+        sg.new_layer();
+        sg.layer_mut(1)?.add_child(0)?;
+
+        // Indexed, so the root carries maintained bounds and `pos_subtree` takes the kd-tree
+        // path — the combination the pruning is actually for.
+        let root = sg.new_indexed_node(vec![Feature::new("name", "room")]);
+        let root = sg.layer_mut(1)?.push_node(root)?;
+
+        let mut points = Vec::new();
+        let mut state: u64 = 0x1234_5678;
+        let mut next = |lo: f64, hi: f64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            lo + (hi - lo) * ((state >> 40) as f64 / (1u64 << 24) as f64)
+        };
+        for _ in 0..400 {
+            let at = Coordinate::new(next(-5.0, 5.0), next(-5.0, 5.0), next(-5.0, 5.0));
+            let point = push_at(&mut sg, 0, at)?;
+            sg.nest(point).under(root)?;
+            points.push((point, at));
+        }
+
+        let half_angle = 35_f64.to_radians();
+        let mut ever_rejected = false;
+        let mut ever_returned = false;
+        for _ in 0..300 {
+            // Apexes range well outside the point cloud as well as inside it, so the box is
+            // sometimes unreachable, sometimes enclosing the observer.
+            let apex = Coordinate::new(next(-14.0, 14.0), next(-14.0, 14.0), next(-14.0, 14.0));
+            let dir = Coordinate::new(next(-1.0, 1.0), next(-1.0, 1.0), next(-1.0, 1.0));
+            let Ok(observer) = Observer::new_looking_along(apex, dir, half_angle, 0.3, 8.0) else {
+                continue;
+            };
+
+            // The unpruned answer, straight from the predicate.
+            let mut expected: Vec<NodeId> = points
+                .iter()
+                .filter(|(_, at)| observer.observers(&Coordinate::new(at.x, at.y, at.z)))
+                .map(|(nid, _)| *nid)
+                .collect();
+            expected.sort();
+
+            let got = sorted(sg.visible_in_subtree(&observer, root));
+            assert_eq!(got, expected, "pruning changed the answer for apex {apex:?}");
+
+            ever_rejected |= expected.is_empty();
+            ever_returned |= !expected.is_empty();
+        }
+        assert!(
+            ever_rejected && ever_returned,
+            "poses covered only one outcome, so the comparison proves little"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn visible_in_subtree_agrees_between_indexed_and_plain_roots() -> Result<()> {
+        // Layer 1 (semantic)  ── Layer 0 (points)
+        //
+        // indexed_root  ├── (in view) ├── (also in view) ├── (off axis) └── (too far)
+        // plain_root    ├── (in view) ├── (also in view) ├── (off axis) └── (too far)
+        //
+        // `pos_subtree` reads an indexed node's kd-tree and returns instead of walking
+        // that node's children, so the indexed and non-indexed roots reach the coordinates
+        // through entirely separate code and have to agree on the answer.
+        let mut sg = SceneGraph::default();
+        sg.new_layer();
+        sg.new_layer();
+        sg.layer_mut(1)?.add_child(0)?;
+
+        let indexed_root = sg.new_indexed_node(vec![Feature::new("name", "indexed")]);
+        let indexed_root = sg.layer_mut(1)?.push_node(indexed_root)?;
+        let plain_root = sg.new_node(vec![Feature::new("name", "plain")]);
+        let plain_root = sg.layer_mut(1)?.push_node(plain_root)?;
+
+        // A node may have only one parent, so each root gets its own copy of the points.
+        let mut visible_under = Vec::new();
+        for root in [indexed_root, plain_root] {
+            let mut visible = Vec::new();
+            for at in [IN_VIEW, ALSO_IN_VIEW, OFF_AXIS, TOO_FAR] {
+                let point = push_at(&mut sg, 0, at)?;
+                sg.nest(point).under(root)?;
+                if at == IN_VIEW || at == ALSO_IN_VIEW {
+                    visible.push(point);
+                }
+            }
+            visible_under.push(sorted(visible));
+        }
+
+        let from_indexed = sorted(sg.visible_in_subtree(&cone(), indexed_root));
+        let from_plain = sorted(sg.visible_in_subtree(&cone(), plain_root));
+
+        assert_eq!(
+            from_indexed, visible_under[0],
+            "the indexed root's kd-tree path missed or invented a visible point"
+        );
+        assert_eq!(
+            from_plain, visible_under[1],
+            "the plain root's recursive path missed or invented a visible point"
+        );
+        assert_eq!(
+            from_indexed.len(),
+            from_plain.len(),
+            "the indexed and plain paths disagree on how many nodes are visible: \
+             {from_indexed:?} vs {from_plain:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn visible_in_subtree_reports_only_visible_nodes_unlike_visible_subgraph() -> Result<()> {
+        // Layer 1 (objects) ── Layer 0 (points)
+        //
+        // root (off axis)
+        // └── point (in view)
+        //
+        // The split between the two queries is the point of having both:
+        // `visible_in_subtree` lists the nodes that are themselves in view, while
+        // `visible_subgraph` additionally keeps the invisible ancestors needed to reach
+        // them.
+        let mut sg = SceneGraph::default();
+        sg.new_layer();
+        sg.new_layer();
+        sg.layer_mut(1)?.add_child(0)?;
+
+        let root = push_at(&mut sg, 1, OFF_AXIS)?;
+        let point = push_at(&mut sg, 0, IN_VIEW)?;
+        sg.nest(point).under(root)?;
+
+        let observer = cone();
+        assert_eq!(
+            sg.visible_in_subtree(&observer, root),
+            vec![point],
+            "the off-axis root is not itself visible, so it is not reported"
+        );
+
+        let subgraph = sg.visible_subgraph(&observer, root)?;
+        assert_eq!(
+            subgraph
+                .layer(0)?
+                .nodes
+                .iter()
+                .map(|n| n.id)
+                .collect::<Vec<_>>(),
+            vec![point]
+        );
+        assert_eq!(
+            subgraph
+                .layer(1)?
+                .nodes
+                .iter()
+                .map(|n| n.id)
+                .collect::<Vec<_>>(),
+            vec![root],
+            "visible_subgraph keeps the invisible root so the visible point stays reachable"
+        );
+
+        Ok(())
+    }
+}

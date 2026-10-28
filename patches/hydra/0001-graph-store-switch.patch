@@ -1,0 +1,119 @@
+diff --git a/include/hydra/backend/backend_module.h b/include/hydra/backend/backend_module.h
+index f0ab305..2ba8206 100644
+--- a/include/hydra/backend/backend_module.h
++++ b/include/hydra/backend/backend_module.h
+@@ -49,6 +49,7 @@
+ #include "hydra/backend/pgmo_configs.h"
+ #include "hydra/common/module.h"
+ #include "hydra/common/output_sink.h"
++#include "hydra/backend/graph_store.h"
+ #include "hydra/common/shared_dsg_info.h"
+ #include "hydra/common/shared_module_state.h"
+ 
+@@ -179,6 +180,7 @@ class BackendModule : public kimera_pgmo::KimeraPgmoInterface, public Module {
+   ExternalLoopClosureReceiver external_lc_receiver_;
+ 
+   Sink::List sinks_;
++  GraphStore::Ptr graph_store_;
+ 
+   // TODO(lschmid): This mutex currently simply locks all data for manipulation.
+   std::mutex mutex_;
+diff --git a/include/hydra/backend/graph_store.h b/include/hydra/backend/graph_store.h
+new file mode 100644
+index 0000000..16b7c5e
+--- /dev/null
++++ b/include/hydra/backend/graph_store.h
+@@ -0,0 +1,35 @@
++#pragma once
++#include <spark_dsg/dynamic_scene_graph.h>
++
++#include <cstdint>
++#include <filesystem>
++#include <functional>
++#include <memory>
++#include <string>
++
++namespace hydra {
++
++//! Alternative storage for the backend scene graph (e.g. Yggdrasil), selected at runtime
++//! with the HYDRA_GRAPH_BACKEND environment variable: spark (default), yggdrasil or both.
++struct GraphStore {
++  using Ptr = std::unique_ptr<GraphStore>;
++  using Factory = std::function<Ptr(const std::string& mode)>;
++
++  virtual ~GraphStore() = default;
++
++  //! Store the latest backend graph. Returns the graph that downstream consumers (publishers,
++  //! sinks) should see instead of the spark_dsg one, or nullptr to keep the spark_dsg graph.
++  virtual spark_dsg::DynamicSceneGraph::Ptr store(uint64_t timestamp_ns,
++                                                  const spark_dsg::DynamicSceneGraph& graph) = 0;
++
++  //! Write the stored graph (and any comparison report) into the backend output directory.
++  virtual void save(const std::filesystem::path& backend_dir) const = 0;
++
++  //! Set by the library that provides a store (e.g. libhydra_ygg_sink.so) when it loads.
++  static Factory& factory() {
++    static Factory f;
++    return f;
++  }
++};
++
++}  // namespace hydra
+diff --git a/src/backend/backend_module.cpp b/src/backend/backend_module.cpp
+index 7b0dd87..4d66ffe 100644
+--- a/src/backend/backend_module.cpp
++++ b/src/backend/backend_module.cpp
+@@ -43,6 +43,8 @@
+ #include <kimera_pgmo/pcl_mesh_traits.h>
+ #include <kimera_pgmo/utils/mesh_io.h>
+ 
++#include <cstdlib>
++
+ #include "hydra/backend/backend_utilities.h"
+ #include "hydra/backend/mst_factors.h"
+ #include "hydra/common/global_info.h"
+@@ -127,6 +129,16 @@ BackendModule::BackendModule(const Config& config,
+   // set up pgmo mesh infrastructure
+   original_vertices_.reset(new pcl::PointCloud<pcl::PointXYZ>());
+   vertex_stamps_.reset(new std::vector<uint64_t>());
++
++  // pick the scene graph backend: spark (default), yggdrasil or both
++  const char* mode = std::getenv("HYDRA_GRAPH_BACKEND");
++  if (mode && std::string(mode) != "spark") {
++    CHECK(GraphStore::factory())
++        << "HYDRA_GRAPH_BACKEND=" << mode
++        << " needs a graph store library, e.g. LD_PRELOAD=.../libhydra_ygg_sink.so";
++    graph_store_ = GraphStore::factory()(mode);
++    LOG(WARNING) << "[Hydra Backend] scene graph backend: " << mode;
++  }
+ }
+ 
+ BackendModule::~BackendModule() { stopImpl(); }
+@@ -155,6 +167,9 @@ void BackendModule::save(const DataDirectory& output) {
+ 
+   const auto backend_path = output.path("backend");
+   backend_graph_logger_.save(backend_path);
++  if (graph_store_) {
++    graph_store_->save(backend_path);
++  }
+ 
+   const auto filename = output.path("backend/pgmo") / "dsg_pgmo_status.csv";
+   writeBackendStatus(status_log_, filename);
+@@ -269,7 +284,16 @@ bool BackendModule::spinOnce(bool force_update) {
+   logStatus();
+ 
+   ScopedTimer sink_timer("backend/sinks", timestamp_ns);
+-  Sink::callAll(sinks_, timestamp_ns, *private_dsg_->graph, *deformation_graph_);
++  const DynamicSceneGraph* output = private_dsg_->graph.get();
++  DynamicSceneGraph::Ptr stored;
++  if (graph_store_) {
++    std::lock_guard<std::mutex> graph_lock(private_dsg_->mutex);
++    stored = graph_store_->store(timestamp_ns, *private_dsg_->graph);
++    if (stored) {
++      output = stored.get();
++    }
++  }
++  Sink::callAll(sinks_, timestamp_ns, *output, *deformation_graph_);
+   return true;
+ }
+ 

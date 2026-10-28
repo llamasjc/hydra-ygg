@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Record3D to ROS</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; background: #fff; color: #111; }
+  video { width: 480px; max-width: 100%; background: #000; }
+  #status { font-family: monospace; white-space: pre; margin-top: 8px; }
+  input[type=text] { width: 16em; }
+</style>
+</head>
+<body>
+<h2>Record3D Wi-Fi to ROS</h2>
+<p>In Record3D choose Wi-Fi streaming and press the red button, then enter the address it shows.
+Use Chrome or Safari.</p>
+<form id="start">
+  <input type="text" id="phone" placeholder="phone address, e.g. 192.168.1.23">
+  <label>send every <input type="number" id="every" value="2" min="1" style="width:3em"> frames</label>
+  <input type="submit" value="Start">
+</form>
+<video playsinline autoplay muted></video>
+<div id="status">idle</div>
+<canvas id="canvas" style="display:none"></canvas>
+<script>
+// Each streamed video frame is [depth as hue | colour] side by side. Every few frames the
+// page decodes the depth (to millimetres), compresses the colour to JPEG and posts both, with
+// the frame's metadata (intrinsics, pose), to the bridge that served this page; the bridge
+// publishes ROS topics. Kept small so it also works over a slow link.
+const OUT_W = 256;  // most width of each half sent to the bridge (LiDAR depth is 256x192)
+const video = document.querySelector('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+const status = document.getElementById('status');
+const meta = {};
+let lastError = '';
+let streamMeta = null, sent = 0, dropped = 0, frames = 0, busy = false, firstMetaShown = false;
+
+function log(s) { status.textContent = s; }
+
+async function start(addr, every) {
+  if (!addr.startsWith('http://')) addr = 'http://' + addr;
+  try { streamMeta = await (await fetch(addr + '/metadata')).json(); } catch (e) { streamMeta = null; }
+  await fetch('/stream_metadata', { method: 'POST', body: JSON.stringify(streamMeta || {}) });
+
+  const pc = new RTCPeerConnection();
+  pc.onicecandidate = e => {
+    if (e.candidate === null) {
+      fetch(addr + '/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'answer', data: pc.localDescription.sdp }) });
+    }
+  };
+  pc.ontrack = e => {
+    if ('RTCRtpScriptTransform' in window) {
+      const worker = new Worker('worker.js');
+      worker.onmessage = m => { meta[m.data.frameTimestamp] = m.data.metadata; };
+      e.receiver.transform = new RTCRtpScriptTransform(worker, { name: 'receiverTransform' });
+    } else {
+      log('This browser cannot read per-frame pose (no RTCRtpScriptTransform). Use Chrome 110+ or Safari.');
+    }
+    video.srcObject = e.streams[0];
+    video.play();
+    video.requestVideoFrameCallback(function onFrame(now, info) {
+      frames++;
+      const m = meta[info.rtpTimestamp];
+      delete meta[info.rtpTimestamp];
+      if (m && frames % every === 0) send(m, info);
+      video.requestVideoFrameCallback(onFrame);
+    });
+  };
+  const offer = await (await fetch(addr + '/getOffer')).json();
+  await pc.setRemoteDescription(offer);
+  await pc.setLocalDescription(await pc.createAnswer());
+  log('connecting to ' + addr + ' ...');
+}
+
+async function send(m, info) {
+  if (busy) { dropped++; return; }
+  busy = true;
+  try {
+    // each half at the video's own resolution, at most OUT_W wide
+    const halfW = video.videoWidth / 2, h = video.videoHeight;
+    const w = Math.min(OUT_W, halfW), outH = Math.round(w * h / halfW);
+    canvas.width = 2 * w; canvas.height = outH;
+    ctx.drawImage(video, 0, 0, 2 * w, outH);
+    const px = ctx.getImageData(0, 0, w, outH).data;  // left half: depth as hue
+    // depth in millimetres from the hue (depth = 3 m * hue), 2 bytes per pixel
+    const depth = new Uint16Array(w * outH);
+    for (let i = 0; i < w * outH; i++) {
+      const r = px[4 * i] / 255, g = px[4 * i + 1] / 255, b = px[4 * i + 2] / 255;
+      const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+      let hue = 0;
+      if (d > 1e-6) {
+        if (mx === r) hue = ((g - b) / d) % 6; else if (mx === g) hue = (b - r) / d + 2; else hue = (r - g) / d + 4;
+        hue /= 6; if (hue < 0) hue += 1;
+      }
+      depth[i] = Math.round(3000 * hue);
+    }
+    // right half: colour, as JPEG
+    const colour = document.createElement('canvas');
+    colour.width = w; colour.height = outH;
+    colour.getContext('2d').drawImage(canvas, w, 0, w, outH, 0, 0, w, outH);
+    const jpeg = await new Promise(res => colour.toBlob(res, 'image/jpeg', 0.85));
+    if (!firstMetaShown) { console.log('first frame metadata', m); firstMetaShown = true; }
+    await fetch('/frame', {
+      signal: AbortSignal.timeout(5000),
+      method: 'POST',
+      headers: {
+        'X-Meta': JSON.stringify(m),
+        'X-Size': `${w}x${outH}`,
+        'X-Jpeg-Bytes': String(jpeg.size),
+      },
+      body: new Blob([jpeg, depth.buffer]),
+    });
+    sent++;
+  } catch (e) { dropped++; lastError = String(e); }
+  finally { busy = false; }
+  log(`video ${video.videoWidth}x${video.videoHeight}, frames ${frames}, sent ${sent}, skipped ${dropped}` +
+      (lastError ? `\nlast error: ${lastError}` : ''));
+}
+
+document.getElementById('start').onsubmit = e => {
+  e.preventDefault();
+  start(document.getElementById('phone').value.trim(),
+        Math.max(1, parseInt(document.getElementById('every').value) || 1))
+    .catch(err => log('error: ' + err));
+};
+</script>
+</body>
+</html>

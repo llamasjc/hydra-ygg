@@ -1,0 +1,103 @@
+diff --git a/src/utils/nearest_neighbor_utilities.cpp b/src/utils/nearest_neighbor_utilities.cpp
+index a672166..b5f0601 100644
+--- a/src/utils/nearest_neighbor_utilities.cpp
++++ b/src/utils/nearest_neighbor_utilities.cpp
+@@ -36,7 +36,9 @@
+ 
+ #include <glog/logging.h>
+ 
++#include <algorithm>
+ #include <atomic>
++#include <cmath>
+ #include <cstdlib>
+ #include <iostream>
+ #include <nanoflann.hpp>
+@@ -88,32 +90,42 @@ NnMode nnMode() {
+   return mode;
+ }
+ 
+-//! Count queries where the alternative backend disagrees with nanoflann.
+-void recordComparison(const char* what, bool same) {
++//! Compare the alternative backend with nanoflann. Results whose node lists differ but whose
++//! distance lists agree (to 1e-9 relative) are ties: equally close nodes kept in a different
++//! order or choice. Anything else is a real difference and is printed in full (first 20).
++void recordComparison(const char* what,
++                      const std::vector<size_t>& ids,
++                      const std::vector<double>& dists,
++                      const std::vector<NearestNodeBackend::Result>& other) {
+   static std::atomic<size_t> queries{0};
++  static std::atomic<size_t> ties{0};
+   static std::atomic<size_t> differ{0};
+-  const size_t n = ++queries;
+-  const size_t d = same ? differ.load() : ++differ;
+-  if (!same && d <= 20) {
+-    std::cerr << "[NearestNodeFinder] " << what << " result differs from nanoflann" << std::endl;
++  bool same_ids = ids.size() == other.size();
++  bool same_dists = same_ids;
++  for (size_t i = 0; same_ids && i < ids.size(); ++i) {
++    same_ids = ids[i] == other[i].index;
+   }
+-  if (n % 1000 == 0) {
+-    std::cerr << "[NearestNodeFinder] " << n << " queries, " << d << " differ from nanoflann"
+-              << std::endl;
++  for (size_t i = 0; same_dists && i < dists.size(); ++i) {
++    const double tol = 1e-9 * std::max(1.0, std::abs(dists[i]));
++    same_dists = std::abs(dists[i] - other[i].distance) <= tol;
+   }
+-}
+-
+-bool sameIndices(const std::vector<size_t>& lhs,
+-                 const std::vector<NearestNodeBackend::Result>& rhs) {
+-  if (lhs.size() != rhs.size()) {
+-    return false;
+-  }
+-  for (size_t i = 0; i < lhs.size(); ++i) {
+-    if (lhs[i] != rhs[i].index) {
+-      return false;
++  const size_t n = ++queries;
++  if (!same_ids && same_dists) {
++    ++ties;
++  } else if (!same_ids && ++differ <= 20) {
++    std::cerr << "[NearestNodeFinder] " << what << " differs from nanoflann:";
++    for (size_t i = 0; i < std::max(ids.size(), other.size()); ++i) {
++      std::cerr << "\n    #" << i << " nanoflann ";
++      if (i < ids.size()) std::cerr << ids[i] << " d=" << dists[i];
++      std::cerr << " | yggdrasil ";
++      if (i < other.size()) std::cerr << other[i].index << " d=" << other[i].distance;
+     }
++    std::cerr << std::endl;
++  }
++  if (n % 1000 == 0) {
++    std::cerr << "[NearestNodeFinder] " << n << " queries, " << differ.load()
++              << " differ from nanoflann, " << ties.load() << " ties" << std::endl;
+   }
+-  return true;
+ }
+ 
+ }  // namespace
+@@ -197,7 +209,8 @@ void NearestNodeFinder::find(const Eigen::Vector3d& position,
+         position.data(), limit, nn_indices.data(), distances.data());
+     if (internals_->mode == NnMode::BOTH) {
+       nn_indices.resize(num_found);
+-      recordComparison("knn", sameIndices(nn_indices, internals_->backend->knn(position, limit)));
++      distances.resize(num_found);
++      recordComparison("knn", nn_indices, distances, internals_->backend->knn(position, limit));
+     }
+   }
+ 
+@@ -223,11 +236,13 @@ size_t NearestNodeFinder::findRadius(const Eigen::Vector3d& position,
+         position.data(), radius, neighbors, nanoflann::SearchParameters());
+     if (internals_->mode == NnMode::BOTH) {
+       std::vector<size_t> found;
++      std::vector<double> found_dists;
+       for (const auto& n : neighbors) {
+         found.push_back(n.first);
++        found_dists.push_back(n.second);
+       }
+-      recordComparison("radius",
+-                       sameIndices(found, internals_->backend->radius(position, radius)));
++      recordComparison(
++          "radius", found, found_dists, internals_->backend->radius(position, radius));
+     }
+   }
+ 

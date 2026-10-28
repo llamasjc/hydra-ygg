@@ -1,0 +1,190 @@
+diff --git a/include/hydra/utils/nearest_neighbor_utilities.h b/include/hydra/utils/nearest_neighbor_utilities.h
+index 2a12817..afebe41 100644
+--- a/include/hydra/utils/nearest_neighbor_utilities.h
++++ b/include/hydra/utils/nearest_neighbor_utilities.h
+@@ -41,6 +41,31 @@
+ 
+ namespace hydra {
+ 
++//! Alternative nearest-node search (e.g. Yggdrasil's spatial index), selected with the
++//! HYDRA_NN_BACKEND environment variable: nanoflann (default), yggdrasil, or both (nanoflann
++//! answers, the alternative runs alongside and disagreements are counted).
++struct NearestNodeBackend {
++  //! A result: index into the node list the backend was built from, and squared distance
++  //! (what nanoflann reports, and what Hydra's callers expect).
++  struct Result {
++    size_t index;
++    double distance;
++  };
++  using Ptr = std::unique_ptr<NearestNodeBackend>;
++  using Factory = std::function<Ptr(const std::vector<Eigen::Vector3d>& points)>;
++
++  virtual ~NearestNodeBackend() = default;
++  virtual std::vector<Result> knn(const Eigen::Vector3d& position, size_t count) const = 0;
++  //! `radius` is in squared distance, as nanoflann's radiusSearch takes it
++  virtual std::vector<Result> radius(const Eigen::Vector3d& position, double radius) const = 0;
++
++  //! Set by the library that provides a backend (e.g. libhydra_ygg_sink.so) when it loads.
++  static Factory& factory() {
++    static Factory f;
++    return f;
++  }
++};
++
+ class NearestNodeFinder {
+  public:
+   using Callback = std::function<void(NodeId, size_t, double)>;
+diff --git a/src/utils/nearest_neighbor_utilities.cpp b/src/utils/nearest_neighbor_utilities.cpp
+index c1e455d..a672166 100644
+--- a/src/utils/nearest_neighbor_utilities.cpp
++++ b/src/utils/nearest_neighbor_utilities.cpp
+@@ -36,6 +36,9 @@
+ 
+ #include <glog/logging.h>
+ 
++#include <atomic>
++#include <cstdlib>
++#include <iostream>
+ #include <nanoflann.hpp>
+ 
+ namespace hydra {
+@@ -63,20 +66,84 @@ struct GraphKdTreeAdaptor {
+   std::vector<NodeId> nodes;
+ };
+ 
++namespace {
++
++enum class NnMode { NANOFLANN, YGGDRASIL, BOTH };
++
++NnMode nnMode() {
++  static const NnMode mode = [] {
++    const char* env = std::getenv("HYDRA_NN_BACKEND");
++    const std::string value = env ? env : "nanoflann";
++    if (value == "nanoflann") {
++      return NnMode::NANOFLANN;
++    }
++    CHECK(NearestNodeBackend::factory())
++        << "HYDRA_NN_BACKEND=" << value
++        << " needs a backend library, e.g. LD_PRELOAD=.../libhydra_ygg_sink.so";
++    CHECK(value == "yggdrasil" || value == "both")
++        << "HYDRA_NN_BACKEND must be nanoflann, yggdrasil or both, not " << value;
++    std::cerr << "[NearestNodeFinder] backend: " << value << std::endl;
++    return value == "yggdrasil" ? NnMode::YGGDRASIL : NnMode::BOTH;
++  }();
++  return mode;
++}
++
++//! Count queries where the alternative backend disagrees with nanoflann.
++void recordComparison(const char* what, bool same) {
++  static std::atomic<size_t> queries{0};
++  static std::atomic<size_t> differ{0};
++  const size_t n = ++queries;
++  const size_t d = same ? differ.load() : ++differ;
++  if (!same && d <= 20) {
++    std::cerr << "[NearestNodeFinder] " << what << " result differs from nanoflann" << std::endl;
++  }
++  if (n % 1000 == 0) {
++    std::cerr << "[NearestNodeFinder] " << n << " queries, " << d << " differ from nanoflann"
++              << std::endl;
++  }
++}
++
++bool sameIndices(const std::vector<size_t>& lhs,
++                 const std::vector<NearestNodeBackend::Result>& rhs) {
++  if (lhs.size() != rhs.size()) {
++    return false;
++  }
++  for (size_t i = 0; i < lhs.size(); ++i) {
++    if (lhs[i] != rhs[i].index) {
++      return false;
++    }
++  }
++  return true;
++}
++
++}  // namespace
++
+ struct NearestNodeFinder::Detail {
+   using Dist = L2_Simple_Adaptor<double, GraphKdTreeAdaptor>;
+   using KDTree = KDTreeSingleIndexAdaptor<Dist, GraphKdTreeAdaptor, 3, size_t>;
+ 
+   Detail(const SceneGraphLayer& layer, const std::vector<NodeId>& nodes)
+-      : adaptor(layer, nodes) {
+-    kdtree.reset(new KDTree(3, adaptor));
+-    kdtree->buildIndex();
++      : adaptor(layer, nodes), mode(nnMode()) {
++    if (mode != NnMode::YGGDRASIL) {
++      kdtree.reset(new KDTree(3, adaptor));
++      kdtree->buildIndex();
++    }
++    if (mode != NnMode::NANOFLANN) {
++      std::vector<Eigen::Vector3d> points;
++      points.reserve(nodes.size());
++      for (const auto id : nodes) {
++        points.push_back(getNodePosition(layer, id));
++      }
++      backend = NearestNodeBackend::factory()(points);
++    }
+   }
+ 
+   ~Detail() = default;
+ 
+   GraphKdTreeAdaptor adaptor;
++  const NnMode mode;
+   std::unique_ptr<KDTree> kdtree;
++  NearestNodeBackend::Ptr backend;
+ };
+ 
+ NearestNodeFinder::NearestNodeFinder(const SceneGraphLayer& layer,
+@@ -117,8 +184,22 @@ void NearestNodeFinder::find(const Eigen::Vector3d& position,
+   std::vector<size_t> nn_indices(limit);
+   std::vector<double> distances(limit);
+ 
+-  size_t num_found = internals_->kdtree->knnSearch(
+-      position.data(), limit, nn_indices.data(), distances.data());
++  size_t num_found = 0;
++  if (internals_->mode == NnMode::YGGDRASIL) {
++    const auto results = internals_->backend->knn(position, limit);
++    num_found = results.size();
++    for (size_t i = 0; i < num_found; ++i) {
++      nn_indices[i] = results[i].index;
++      distances[i] = results[i].distance;
++    }
++  } else {
++    num_found = internals_->kdtree->knnSearch(
++        position.data(), limit, nn_indices.data(), distances.data());
++    if (internals_->mode == NnMode::BOTH) {
++      nn_indices.resize(num_found);
++      recordComparison("knn", sameIndices(nn_indices, internals_->backend->knn(position, limit)));
++    }
++  }
+ 
+   size_t i = skip_first ? 1 : 0;
+   for (; i < num_found; ++i) {
+@@ -131,8 +212,24 @@ size_t NearestNodeFinder::findRadius(const Eigen::Vector3d& position,
+                                      bool skip_first,
+                                      const NearestNodeFinder::Callback& callback) {
+   std::vector<nanoflann::ResultItem<size_t, double>> neighbors;
+-  size_t num_found = internals_->kdtree->radiusSearch(
+-      position.data(), radius, neighbors, nanoflann::SearchParameters());
++  size_t num_found = 0;
++  if (internals_->mode == NnMode::YGGDRASIL) {
++    for (const auto& r : internals_->backend->radius(position, radius)) {
++      neighbors.emplace_back(r.index, r.distance);
++    }
++    num_found = neighbors.size();
++  } else {
++    num_found = internals_->kdtree->radiusSearch(
++        position.data(), radius, neighbors, nanoflann::SearchParameters());
++    if (internals_->mode == NnMode::BOTH) {
++      std::vector<size_t> found;
++      for (const auto& n : neighbors) {
++        found.push_back(n.first);
++      }
++      recordComparison("radius",
++                       sameIndices(found, internals_->backend->radius(position, radius)));
++    }
++  }
+ 
+   size_t i = skip_first ? 1 : 0;
+   for (; i < num_found; ++i) {

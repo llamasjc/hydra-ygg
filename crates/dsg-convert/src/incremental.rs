@@ -14,7 +14,7 @@ use crate::{F_ATTRS, F_DSG_ID, F_EXTRA_EDGES, F_LABEL, F_PARENT_EDGE, LayerKey, 
 
 /// Hydra's standard layers (objects, agents, places, mesh places, rooms, buildings). They are
 /// created up front so their first node later on does not force a renumbering rebuild.
-const HYDRA_LAYERS: [LayerKey; 6] = [(2, 0), (2, 97), (3, 0), (3, 1), (4, 0), (5, 0)];
+pub const HYDRA_LAYERS: [LayerKey; 6] = [(2, 0), (2, 97), (3, 0), (3, 1), (4, 0), (5, 0)];
 
 type EdgeKey = (u64, u64);
 
@@ -23,7 +23,7 @@ struct NodeState {
     key: LayerKey,
     attrs: String,
     label: Option<String>,
-    pos: Option<[f32; 3]>,
+    pos: Option<[f64; 3]>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -95,7 +95,7 @@ fn node_state(node: &Value) -> NodeState {
         let p = p
             .as_array()?
             .iter()
-            .map(|v| v.as_f64().unwrap() as f32)
+            .map(|v| v.as_f64().unwrap())
             .collect::<Vec<_>>();
         Some([p[0], p[1], p[2]])
     });
@@ -110,6 +110,16 @@ fn node_state(node: &Value) -> NodeState {
 impl Mirror {
     pub fn header(&self) -> &Value {
         &self.header
+    }
+
+    /// Spark-DSG ids of the nodes the mirror holds.
+    pub fn node_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.raw.keys().copied()
+    }
+
+    /// Undirected (smaller id, larger id) pairs of the edges the mirror holds.
+    pub fn edge_pairs(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.edges.keys().copied()
     }
 
     pub fn export(&self) -> Value {

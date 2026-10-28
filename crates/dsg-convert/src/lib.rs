@@ -14,6 +14,8 @@
 
 pub mod compare;
 pub mod incremental;
+pub mod topology;
+pub mod typed;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -73,7 +75,7 @@ pub fn import(input: &Value) -> (SceneGraph, BTreeMap<LayerKey, u32>, Report) {
         features.push(Feature::new(F_ATTRS, Value::Object(attrs)));
         let anon = match position.as_ref().and_then(Value::as_array) {
             Some(p) => {
-                let c: Vec<f32> = p.iter().map(|v| v.as_f64().unwrap() as f32).collect();
+                let c: Vec<f64> = p.iter().map(|v| v.as_f64().unwrap()).collect();
                 sg.new_coordinates(c[0], c[1], c[2], features)
             }
             None => {

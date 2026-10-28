@@ -1,0 +1,373 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ba200b4..3711ce4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -91,6 +91,7 @@ add_library(
+   src/dynamic_scene_graph.cpp
+   src/edge_attributes.cpp
+   src/edge_container.cpp
++  src/graph_backend.cpp
+   src/labelspace.cpp
+   src/layer_view.cpp
+   src/mesh.cpp
+diff --git a/include/spark_dsg/dynamic_scene_graph.h b/include/spark_dsg/dynamic_scene_graph.h
+index 05d6464..81221ea 100644
+--- a/include/spark_dsg/dynamic_scene_graph.h
++++ b/include/spark_dsg/dynamic_scene_graph.h
+@@ -38,6 +38,8 @@
+ #include <nlohmann/json.hpp>
+ #include <type_traits>
+ 
++#include "spark_dsg/graph_backend.h"
++#include "spark_dsg/graph_observer.h"
+ #include "spark_dsg/metadata.h"
+ #include "spark_dsg/scene_graph_layer.h"
+ #include "spark_dsg/spark_dsg_fwd.h"
+@@ -533,7 +535,20 @@ class DynamicSceneGraph {
+   std::map<LayerId, Partitions> layer_partitions_;
+ 
+   EdgeContainer interlayer_edges_;
+-  GraphObserver* observer_ = nullptr;
++
++  //! Passes structure changes to the backend (if any) and the observer (if any)
++  struct Hooks : GraphObserver {
++    GraphObserver* user = nullptr;
++    GraphBackend* backend = nullptr;
++    void nodeAdded(NodeId node) override;
++    void nodeAddedTo(NodeId node, LayerKey layer, const NodeAttributes& attrs) override;
++    void nodeRemoved(NodeId node) override;
++    void edgeAdded(NodeId source, NodeId target) override;
++    void edgeRemoved(NodeId source, NodeId target) override;
++    void cleared() override;
++  } hooks_;
++  GraphBackend::Ptr backend_;
++  GraphBackend::Mode backend_mode_ = GraphBackend::Mode::SPARK;
+ 
+   std::shared_ptr<Mesh> mesh_;
+ 
+diff --git a/include/spark_dsg/graph_backend.h b/include/spark_dsg/graph_backend.h
+new file mode 100644
+index 0000000..6b324f7
+--- /dev/null
++++ b/include/spark_dsg/graph_backend.h
+@@ -0,0 +1,46 @@
++#pragma once
++#include <Eigen/Core>
++#include <functional>
++#include <memory>
++#include <set>
++#include <string>
++
++#include "spark_dsg/scene_graph_types.h"
++
++namespace spark_dsg {
++
++//! Alternative storage for a DynamicSceneGraph's structure (hydra-ygg patch), e.g. Yggdrasil.
++//! Selected with SPARK_DSG_BACKEND: spark (default), yggdrasil (structure queries answered by
++//! the backend) or both (spark_dsg answers, the backend is checked against it on every query).
++//! Node and edge attributes stay in spark_dsg either way.
++struct GraphBackend {
++  enum class Mode { SPARK, BACKEND, BOTH };
++  using Ptr = std::unique_ptr<GraphBackend>;
++  using Factory = std::function<Ptr(const std::set<LayerKey>& layers)>;
++
++  virtual ~GraphBackend() = default;
++
++  //! Structure changes, in the order spark_dsg makes them
++  virtual void nodeAdded(NodeId node, LayerKey layer, const Eigen::Vector3d& position) = 0;
++  virtual void nodeRemoved(NodeId node) = 0;
++  virtual void edgeAdded(NodeId source, NodeId target) = 0;
++  virtual void edgeRemoved(NodeId source, NodeId target) = 0;
++  virtual void cleared() = 0;
++
++  //! Structure queries
++  virtual bool hasNode(NodeId node) const = 0;
++  virtual bool hasEdge(NodeId source, NodeId target) const = 0;
++  virtual size_t numNodes() const = 0;
++  virtual size_t numEdges() const = 0;
++
++  //! Set by the library that provides a backend when it loads.
++  static Factory& factory();
++  //! From SPARK_DSG_BACKEND, read once.
++  static Mode mode();
++  //! Report a query where the backend and spark_dsg disagree (BOTH mode). Counted and printed;
++  //! aborts when SPARK_DSG_BACKEND_STRICT is set (used by the tests).
++  static void mismatch(const std::string& what);
++  static size_t mismatches();
++};
++
++}  // namespace spark_dsg
+diff --git a/include/spark_dsg/graph_observer.h b/include/spark_dsg/graph_observer.h
+index b0c13fa..437e588 100644
+--- a/include/spark_dsg/graph_observer.h
++++ b/include/spark_dsg/graph_observer.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "spark_dsg/scene_graph_types.h"
++#include "spark_dsg/spark_dsg_fwd.h"
+ 
+ namespace spark_dsg {
+ 
+@@ -8,6 +9,10 @@ namespace spark_dsg {
+ struct GraphObserver {
+   virtual ~GraphObserver() = default;
+   virtual void nodeAdded(NodeId node) = 0;
++  //! Called instead of nodeAdded when the layer and attributes are known
++  virtual void nodeAddedTo(NodeId node, LayerKey /*layer*/, const NodeAttributes& /*attrs*/) {
++    nodeAdded(node);
++  }
+   virtual void nodeRemoved(NodeId node) = 0;
+   virtual void edgeAdded(NodeId source, NodeId target) = 0;
+   virtual void edgeRemoved(NodeId source, NodeId target) = 0;
+diff --git a/src/dynamic_scene_graph.cpp b/src/dynamic_scene_graph.cpp
+index 0897e98..6620126 100644
+--- a/src/dynamic_scene_graph.cpp
++++ b/src/dynamic_scene_graph.cpp
+@@ -80,17 +80,74 @@ DynamicSceneGraph::DynamicSceneGraph(bool empty)
+ DynamicSceneGraph::DynamicSceneGraph(const LayerKeys& layer_keys,
+                                      const LayerNames& layer_names)
+     : layer_keys_(layersFromNames(layer_names, layer_keys)), layer_names_(layer_names) {
++  backend_mode_ = GraphBackend::mode();
++  if (backend_mode_ != GraphBackend::Mode::SPARK && GraphBackend::factory()) {
++    backend_ = GraphBackend::factory()(layer_keys_);
++    hooks_.backend = backend_.get();
++  }
++  interlayer_edges_.observer = &hooks_;
+   clear();
+ }
+ 
++void DynamicSceneGraph::Hooks::nodeAdded(NodeId node) {
++  if (user) {
++    user->nodeAdded(node);
++  }
++}
++
++void DynamicSceneGraph::Hooks::nodeAddedTo(NodeId node,
++                                           LayerKey layer,
++                                           const NodeAttributes& attrs) {
++  if (backend) {
++    backend->nodeAdded(node, layer, attrs.position);
++  }
++  if (user) {
++    user->nodeAddedTo(node, layer, attrs);
++  }
++}
++
++void DynamicSceneGraph::Hooks::nodeRemoved(NodeId node) {
++  if (backend) {
++    backend->nodeRemoved(node);
++  }
++  if (user) {
++    user->nodeRemoved(node);
++  }
++}
++
++void DynamicSceneGraph::Hooks::edgeAdded(NodeId source, NodeId target) {
++  if (backend) {
++    backend->edgeAdded(source, target);
++  }
++  if (user) {
++    user->edgeAdded(source, target);
++  }
++}
++
++void DynamicSceneGraph::Hooks::edgeRemoved(NodeId source, NodeId target) {
++  if (backend) {
++    backend->edgeRemoved(source, target);
++  }
++  if (user) {
++    user->edgeRemoved(source, target);
++  }
++}
++
++void DynamicSceneGraph::Hooks::cleared() {
++  if (backend) {
++    backend->cleared();
++  }
++  if (user) {
++    user->cleared();
++  }
++}
++
+ DynamicSceneGraph::Ptr DynamicSceneGraph::fromNames(const LayerNames& layers) {
+   return std::make_shared<DynamicSceneGraph>(LayerKeys{}, layers);
+ }
+ 
+ void DynamicSceneGraph::clear(bool include_mesh) {
+-  if (observer_) {
+-    observer_->cleared();
+-  }
++  hooks_.cleared();
+   layers_.clear();
+   layer_partitions_.clear();
+ 
+@@ -341,7 +398,15 @@ bool DynamicSceneGraph::addOrUpdateEdge(NodeId source,
+ }
+ 
+ bool DynamicSceneGraph::hasNode(NodeId node_id) const {
+-  return node_lookup_.count(node_id);
++  const bool spark = node_lookup_.count(node_id);
++  if (!backend_) {
++    return spark;
++  }
++  const bool backend = backend_->hasNode(node_id);
++  if (backend_mode_ == GraphBackend::Mode::BOTH && spark != backend) {
++    GraphBackend::mismatch("hasNode(" + NodeSymbol(node_id).str() + ")");
++  }
++  return backend_mode_ == GraphBackend::Mode::BOTH ? spark : backend;
+ }
+ 
+ NodeStatus DynamicSceneGraph::checkNode(NodeId node_id) const {
+@@ -354,7 +419,16 @@ NodeStatus DynamicSceneGraph::checkNode(NodeId node_id) const {
+ }
+ 
+ bool DynamicSceneGraph::hasEdge(NodeId source, NodeId target) const {
+-  return lookupEdge(source, target).exists;
++  const bool spark = lookupEdge(source, target).exists;
++  if (!backend_) {
++    return spark;
++  }
++  const bool backend = backend_->hasEdge(source, target);
++  if (backend_mode_ == GraphBackend::Mode::BOTH && spark != backend) {
++    GraphBackend::mismatch("hasEdge(" + NodeSymbol(source).str() + ", " +
++                           NodeSymbol(target).str() + ")");
++  }
++  return backend_mode_ == GraphBackend::Mode::BOTH ? spark : backend;
+ }
+ 
+ const Node& DynamicSceneGraph::getNode(NodeId node_id) const {
+@@ -464,7 +538,14 @@ size_t DynamicSceneGraph::numNodes() const {
+     }
+   }
+ 
+-  return total_nodes;
++  if (!backend_) {
++    return total_nodes;
++  }
++  const size_t backend = backend_->numNodes();
++  if (backend_mode_ == GraphBackend::Mode::BOTH && total_nodes != backend) {
++    GraphBackend::mismatch("numNodes");
++  }
++  return backend_mode_ == GraphBackend::Mode::BOTH ? total_nodes : backend;
+ }
+ 
+ size_t DynamicSceneGraph::numUnpartitionedNodes() const {
+@@ -488,7 +569,14 @@ size_t DynamicSceneGraph::numEdges() const {
+     }
+   }
+ 
+-  return total_edges;
++  if (!backend_) {
++    return total_edges;
++  }
++  const size_t backend = backend_->numEdges();
++  if (backend_mode_ == GraphBackend::Mode::BOTH && total_edges != backend) {
++    GraphBackend::mismatch("numEdges");
++  }
++  return backend_mode_ == GraphBackend::Mode::BOTH ? total_edges : backend;
+ }
+ 
+ size_t DynamicSceneGraph::numUnpartitionedEdges() const {
+@@ -739,11 +827,7 @@ DynamicSceneGraph::Ptr DynamicSceneGraph::load(std::filesystem::path filepath) {
+ 
+ void DynamicSceneGraph::setMesh(const std::shared_ptr<Mesh>& mesh) { mesh_ = mesh; }
+ 
+-void DynamicSceneGraph::setObserver(GraphObserver* observer) {
+-  observer_ = observer;
+-  interlayer_edges_.observer = observer;
+-  visitLayers([observer](LayerKey, Layer& layer) { layer.setObserver(observer); });
+-}
++void DynamicSceneGraph::setObserver(GraphObserver* observer) { hooks_.user = observer; }
+ 
+ bool DynamicSceneGraph::hasMesh() const { return mesh_ != nullptr; }
+ 
+@@ -753,7 +837,7 @@ Layer& DynamicSceneGraph::layerFromKey(const LayerKey& key) {
+   layer_keys_.insert(key);
+   if (!key.partition) {
+     auto iter = layers_.emplace(key.layer, std::make_unique<Layer>(key.layer)).first;
+-    iter->second->setObserver(observer_);
++    iter->second->setObserver(&hooks_);
+     return *iter->second;
+   }
+ 
+@@ -764,7 +848,7 @@ Layer& DynamicSceneGraph::layerFromKey(const LayerKey& key) {
+ 
+   auto id_layer_pair =
+       iter->second.emplace(key.partition, std::make_unique<Layer>(key)).first;
+-  id_layer_pair->second->setObserver(observer_);
++  id_layer_pair->second->setObserver(&hooks_);
+   return *id_layer_pair->second;
+ }
+ 
+diff --git a/src/graph_backend.cpp b/src/graph_backend.cpp
+new file mode 100644
+index 0000000..2021ae3
+--- /dev/null
++++ b/src/graph_backend.cpp
+@@ -0,0 +1,44 @@
++#include "spark_dsg/graph_backend.h"
++
++#include <atomic>
++#include <cstdlib>
++#include <iostream>
++
++namespace spark_dsg {
++
++namespace {
++std::atomic<size_t> mismatch_count{0};
++}
++
++GraphBackend::Factory& GraphBackend::factory() {
++  static Factory f;
++  return f;
++}
++
++GraphBackend::Mode GraphBackend::mode() {
++  static const Mode mode = [] {
++    const char* env = std::getenv("SPARK_DSG_BACKEND");
++    const std::string value = env ? env : "spark";
++    if (value == "spark") {
++      return Mode::SPARK;
++    }
++    std::cerr << "[spark_dsg] graph backend: " << value << std::endl;
++    return value == "both" ? Mode::BOTH : Mode::BACKEND;
++  }();
++  return mode;
++}
++
++void GraphBackend::mismatch(const std::string& what) {
++  const size_t n = ++mismatch_count;
++  if (n <= 20 || n % 1000 == 0) {
++    std::cerr << "[spark_dsg] backend disagrees with spark_dsg on " << what << " (" << n
++              << " so far)" << std::endl;
++  }
++  if (std::getenv("SPARK_DSG_BACKEND_STRICT")) {
++    std::abort();
++  }
++}
++
++size_t GraphBackend::mismatches() { return mismatch_count; }
++
++}  // namespace spark_dsg
+diff --git a/src/scene_graph_layer.cpp b/src/scene_graph_layer.cpp
+index c2307eb..f119118 100644
+--- a/src/scene_graph_layer.cpp
++++ b/src/scene_graph_layer.cpp
+@@ -108,7 +108,7 @@ bool SceneGraphLayer::emplaceNode(NodeId node_id,
+       nodes_.emplace(node_id, std::make_unique<Node>(node_id, id, std::move(attrs)))
+           .second;
+   if (added && observer_) {
+-    observer_->nodeAdded(node_id);
++    observer_->nodeAddedTo(node_id, id, nodes_.at(node_id)->attributes());
+   }
+   return added;
+ }
+@@ -281,7 +281,7 @@ void SceneGraphLayer::mergeLayer(const SceneGraphLayer& other_layer,
+     nodes_[other.id] = Node::Ptr(new Node(other.id, id, std::move(attrs)));
+     nodes_status_[other.id] = NodeStatus::NEW;
+     if (observer_) {
+-      observer_->nodeAdded(other.id);
++      observer_->nodeAddedTo(other.id, id, nodes_.at(other.id)->attributes());
+     }
+     if (new_nodes) {
+       new_nodes->push_back(other.id);

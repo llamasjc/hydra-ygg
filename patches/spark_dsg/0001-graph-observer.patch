@@ -1,0 +1,216 @@
+diff --git a/include/spark_dsg/dynamic_scene_graph.h b/include/spark_dsg/dynamic_scene_graph.h
+index 12fc5ae..05d6464 100644
+--- a/include/spark_dsg/dynamic_scene_graph.h
++++ b/include/spark_dsg/dynamic_scene_graph.h
+@@ -473,6 +473,9 @@ class DynamicSceneGraph {
+   //! @brief Set the scene graph mesh
+   void setMesh(const std::shared_ptr<Mesh>& mesh);
+ 
++  //! Report every node and edge change to `observer` (nullptr to stop). Not copied by clone().
++  void setObserver(GraphObserver* observer);
++
+   //! @brief Check if the scene graph has a mesh
+   bool hasMesh() const;
+ 
+@@ -530,6 +533,7 @@ class DynamicSceneGraph {
+   std::map<LayerId, Partitions> layer_partitions_;
+ 
+   EdgeContainer interlayer_edges_;
++  GraphObserver* observer_ = nullptr;
+ 
+   std::shared_ptr<Mesh> mesh_;
+ 
+diff --git a/include/spark_dsg/edge_container.h b/include/spark_dsg/edge_container.h
+index cd4f3a8..2bdea94 100644
+--- a/include/spark_dsg/edge_container.h
++++ b/include/spark_dsg/edge_container.h
+@@ -36,6 +36,7 @@
+ #include <map>
+ #include <vector>
+ 
++#include "spark_dsg/graph_observer.h"
+ #include "spark_dsg/scene_graph_types.h"
+ #include "spark_dsg/spark_dsg_fwd.h"
+ 
+@@ -110,6 +111,7 @@ struct EdgeContainer {
+   Edges edges;
+   mutable EdgeStatusMap edge_status;
+   mutable std::map<EdgeKey, bool> stale_edges;
++  GraphObserver* observer = nullptr;
+ 
+  protected:
+   Edge* find(const EdgeKey& key) const;
+diff --git a/include/spark_dsg/graph_observer.h b/include/spark_dsg/graph_observer.h
+new file mode 100644
+index 0000000..b0c13fa
+--- /dev/null
++++ b/include/spark_dsg/graph_observer.h
+@@ -0,0 +1,17 @@
++#pragma once
++#include "spark_dsg/scene_graph_types.h"
++
++namespace spark_dsg {
++
++//! Told about every node and edge a DynamicSceneGraph gains or loses (hydra-ygg patch).
++//! Attribute changes are not reported: Hydra edits attributes in place.
++struct GraphObserver {
++  virtual ~GraphObserver() = default;
++  virtual void nodeAdded(NodeId node) = 0;
++  virtual void nodeRemoved(NodeId node) = 0;
++  virtual void edgeAdded(NodeId source, NodeId target) = 0;
++  virtual void edgeRemoved(NodeId source, NodeId target) = 0;
++  virtual void cleared() = 0;
++};
++
++}  // namespace spark_dsg
+diff --git a/include/spark_dsg/scene_graph_layer.h b/include/spark_dsg/scene_graph_layer.h
+index bfa3657..e3200d7 100644
+--- a/include/spark_dsg/scene_graph_layer.h
++++ b/include/spark_dsg/scene_graph_layer.h
+@@ -284,6 +284,12 @@ class SceneGraphLayer {
+   //! ID of the layer
+   const LayerKey id;
+ 
++  //! Report node and edge changes to `observer` (nullptr to stop)
++  void setObserver(GraphObserver* observer) {
++    observer_ = observer;
++    edges_.observer = observer;
++  }
++
+  protected:
+   void reset();
+ 
+@@ -300,6 +306,8 @@ class SceneGraphLayer {
+   mutable NodeCheckup nodes_status_;
+   //! internal edge container
+   EdgeContainer edges_;
++  //! told about node and edge changes
++  GraphObserver* observer_ = nullptr;
+ 
+  public:
+   /**
+diff --git a/src/dynamic_scene_graph.cpp b/src/dynamic_scene_graph.cpp
+index 0179549..0897e98 100644
+--- a/src/dynamic_scene_graph.cpp
++++ b/src/dynamic_scene_graph.cpp
+@@ -88,6 +88,9 @@ DynamicSceneGraph::Ptr DynamicSceneGraph::fromNames(const LayerNames& layers) {
+ }
+ 
+ void DynamicSceneGraph::clear(bool include_mesh) {
++  if (observer_) {
++    observer_->cleared();
++  }
+   layers_.clear();
+   layer_partitions_.clear();
+ 
+@@ -736,6 +739,12 @@ DynamicSceneGraph::Ptr DynamicSceneGraph::load(std::filesystem::path filepath) {
+ 
+ void DynamicSceneGraph::setMesh(const std::shared_ptr<Mesh>& mesh) { mesh_ = mesh; }
+ 
++void DynamicSceneGraph::setObserver(GraphObserver* observer) {
++  observer_ = observer;
++  interlayer_edges_.observer = observer;
++  visitLayers([observer](LayerKey, Layer& layer) { layer.setObserver(observer); });
++}
++
+ bool DynamicSceneGraph::hasMesh() const { return mesh_ != nullptr; }
+ 
+ Mesh::Ptr DynamicSceneGraph::mesh() const { return mesh_; }
+@@ -744,6 +753,7 @@ Layer& DynamicSceneGraph::layerFromKey(const LayerKey& key) {
+   layer_keys_.insert(key);
+   if (!key.partition) {
+     auto iter = layers_.emplace(key.layer, std::make_unique<Layer>(key.layer)).first;
++    iter->second->setObserver(observer_);
+     return *iter->second;
+   }
+ 
+@@ -754,6 +764,7 @@ Layer& DynamicSceneGraph::layerFromKey(const LayerKey& key) {
+ 
+   auto id_layer_pair =
+       iter->second.emplace(key.partition, std::make_unique<Layer>(key)).first;
++  id_layer_pair->second->setObserver(observer_);
+   return *id_layer_pair->second;
+ }
+ 
+diff --git a/src/edge_container.cpp b/src/edge_container.cpp
+index cac03b4..dd8f14e 100644
+--- a/src/edge_container.cpp
++++ b/src/edge_container.cpp
+@@ -54,16 +54,23 @@ void EdgeContainer::insert(NodeId source,
+   auto attrs = (edge_info == nullptr) ? std::make_unique<EdgeAttributes>()
+                                       : std::move(edge_info);
+ 
+-  edges.emplace(std::piecewise_construct,
+-                std::forward_as_tuple(source, target),
+-                std::forward_as_tuple(source, target, std::move(attrs)));
++  const bool added = edges
++                         .emplace(std::piecewise_construct,
++                                  std::forward_as_tuple(source, target),
++                                  std::forward_as_tuple(source, target, std::move(attrs)))
++                         .second;
+   edge_status[EdgeKey(source, target)] = EdgeStatus::NEW;
++  if (added && observer) {
++    observer->edgeAdded(source, target);
++  }
+ }
+ 
+ void EdgeContainer::remove(NodeId source, NodeId target) {
+   const EdgeKey key(source, target);
+   edge_status.at(key) = EdgeStatus::DELETED;
+-  edges.erase(key);
++  if (edges.erase(key) && observer) {
++    observer->edgeRemoved(source, target);
++  }
+ }
+ 
+ void EdgeContainer::rewire(NodeId source,
+diff --git a/src/scene_graph_layer.cpp b/src/scene_graph_layer.cpp
+index 36f3f20..c2307eb 100644
+--- a/src/scene_graph_layer.cpp
++++ b/src/scene_graph_layer.cpp
+@@ -104,8 +104,13 @@ const SceneGraphNode& SceneGraphLayer::getNode(NodeId node_id) const {
+ bool SceneGraphLayer::emplaceNode(NodeId node_id,
+                                   std::unique_ptr<NodeAttributes>&& attrs) {
+   nodes_status_[node_id] = NodeStatus::NEW;
+-  return nodes_.emplace(node_id, std::make_unique<Node>(node_id, id, std::move(attrs)))
+-      .second;
++  const bool added =
++      nodes_.emplace(node_id, std::make_unique<Node>(node_id, id, std::move(attrs)))
++          .second;
++  if (added && observer_) {
++    observer_->nodeAdded(node_id);
++  }
++  return added;
+ }
+ 
+ bool SceneGraphLayer::removeNode(NodeId node_id) {
+@@ -122,6 +127,9 @@ bool SceneGraphLayer::removeNode(NodeId node_id) {
+   // remove the actual node
+   nodes_.erase(node_id);
+   nodes_status_[node_id] = NodeStatus::DELETED;
++  if (observer_) {
++    observer_->nodeRemoved(node_id);
++  }
+   return true;
+ }
+ 
+@@ -143,6 +151,9 @@ bool SceneGraphLayer::mergeNodes(NodeId node_from, NodeId node_to) {
+   // remove the actual node
+   nodes_.erase(node_from);
+   nodes_status_[node_from] = NodeStatus::MERGED;
++  if (observer_) {
++    observer_->nodeRemoved(node_from);
++  }
+   return true;
+ }
+ 
+@@ -269,6 +280,9 @@ void SceneGraphLayer::mergeLayer(const SceneGraphLayer& other_layer,
+     }
+     nodes_[other.id] = Node::Ptr(new Node(other.id, id, std::move(attrs)));
+     nodes_status_[other.id] = NodeStatus::NEW;
++    if (observer_) {
++      observer_->nodeAdded(other.id);
++    }
+     if (new_nodes) {
+       new_nodes->push_back(other.id);
+     }

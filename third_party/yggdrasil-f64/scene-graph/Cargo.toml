@@ -1,0 +1,29 @@
+[package]
+name = "scene-graph"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+[[bench]]
+name = "visible_subgraph"
+harness = false
+
+[dependencies]
+glam = { version = "0.34.1", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+# Vendored fork of kiddo. Its lib keeps upstream's `kiddo` name so upstream's own tests and
+# doctests compile unmodified, so it is renamed here instead — code that reads
+# `spatial_index::` is code that gets this workspace's adaptive split policy, not crates.io
+# kiddo's depth-cycled one.
+spatial_index = { package = "spatial-index", path = "../spatial-index" }
+thiserror = "2.0.17"
+
+[dev-dependencies]
+criterion = "0.8.2"
+# `test_utils` carries the RegionMembershipPredicate conformance harness.
+spatial_index = { package = "spatial-index", path = "../spatial-index", features = ["test_utils"] }
+rand = "0.10.1"

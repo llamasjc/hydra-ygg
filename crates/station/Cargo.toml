@@ -1,0 +1,12 @@
+[package]
+name = "station"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dsg-convert.workspace = true
+scene-graph.workspace = true
+serde_json.workspace = true
+flate2.workspace = true

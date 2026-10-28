@@ -185,7 +185,8 @@ impl TypedMirror {
                 None => {
                     self.topology.add_node(n.id, n.key, n.pos);
                     if let Some(l) = n.label {
-                        self.topology.set_feature(n.id, F_LABEL, Some(l.to_string()));
+                        self.topology
+                            .set_feature(n.id, F_LABEL, Some(l.to_string()));
                     }
                     stats.nodes_added += 1;
                 }
@@ -271,21 +272,41 @@ mod tests {
     #[test]
     fn follows_changes_and_reads_back() {
         let mut m = TypedMirror::default();
-        let apply = |m: &mut TypedMirror, nodes: &[(u64, LayerKey, [f64; 3], Vec<u8>)], edges: &[(u64, u64)]| {
+        let apply = |m: &mut TypedMirror,
+                     nodes: &[(u64, LayerKey, [f64; 3], Vec<u8>)],
+                     edges: &[(u64, u64)]| {
             let n: Vec<NodeIn> = nodes
                 .iter()
-                .map(|(id, key, p, r)| NodeIn { id: *id, key: *key, pos: Some(*p), label: Some(7), record: r })
+                .map(|(id, key, p, r)| NodeIn {
+                    id: *id,
+                    key: *key,
+                    pos: Some(*p),
+                    label: Some(7),
+                    record: r,
+                })
                 .collect();
-            let recs: Vec<Vec<u8>> = edges.iter().map(|(s, t)| vec![9, *s as u8, *t as u8]).collect();
+            let recs: Vec<Vec<u8>> = edges
+                .iter()
+                .map(|(s, t)| vec![9, *s as u8, *t as u8])
+                .collect();
             let e: Vec<EdgeIn> = edges
                 .iter()
                 .zip(&recs)
-                .map(|((s, t), r)| EdgeIn { source: *s, target: *t, record: r })
+                .map(|((s, t), r)| EdgeIn {
+                    source: *s,
+                    target: *t,
+                    record: r,
+                })
                 .collect();
             m.apply(b"hdr", &n, &e)
         };
 
-        let a = [node(1, 4, 0.0, 0), node(10, 3, 1.0, 0), node(11, 3, 2.0, 0), node(20, 2, 1.5, 0)];
+        let a = [
+            node(1, 4, 0.0, 0),
+            node(10, 3, 1.0, 0),
+            node(11, 3, 2.0, 0),
+            node(20, 2, 1.5, 0),
+        ];
         let s = apply(&mut m, &a, &[(1, 10), (1, 11), (10, 11), (10, 20)]);
         assert_eq!((s.nodes_added, s.edges_added), (4, 4));
         assert_eq!(s.changed_nodes.len(), 4);
@@ -298,14 +319,28 @@ mod tests {
         // place 10 gone, place 11 moved and changed, object 20 now under 11
         let b = [node(1, 4, 0.0, 0), node(11, 3, 2.5, 1), node(20, 2, 1.5, 0)];
         let s = apply(&mut m, &b, &[(1, 11), (11, 20)]);
-        assert_eq!((s.nodes_removed, s.nodes_updated, s.edges_removed, s.edges_added), (1, 1, 3, 1));
-        assert_eq!((s.removed_nodes.clone(), s.changed_nodes.clone()), (vec![10], vec![11]));
+        assert_eq!(
+            (
+                s.nodes_removed,
+                s.nodes_updated,
+                s.edges_removed,
+                s.edges_added
+            ),
+            (1, 1, 3, 1)
+        );
+        assert_eq!(
+            (s.removed_nodes.clone(), s.changed_nodes.clone()),
+            (vec![10], vec![11])
+        );
         assert_eq!(s.changed_edges, vec![(11, 20)]);
         assert_eq!(m.topology.parent_of(20), Some(11));
         assert!(m.topology.has_edge(1, 11) && !m.topology.has_node(10));
 
         // records come back exactly, in id order
-        assert_eq!(m.node_records(), [vec![0, 1], vec![1, 11], vec![0, 20]].concat());
+        assert_eq!(
+            m.node_records(),
+            [vec![0, 1], vec![1, 11], vec![0, 20]].concat()
+        );
         assert_eq!(m.edge_records(), [vec![9, 1, 11], vec![9, 11, 20]].concat());
         assert_eq!(m.header(), b"hdr");
     }

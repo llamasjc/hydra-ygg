@@ -273,11 +273,11 @@ impl TypedStore {
             .collect::<Result<Vec<_>, String>>()?;
         let s = self.inner.apply(header, &nodes, &edges);
         // A failed write (disk full, station gone) stops recording, never the mapping.
-        if let Some(r) = &mut self.recorder {
-            if let Err(e) = r.write(self.time_ns, header, &nodes, &edges, &s) {
-                eprintln!("[YggdrasilStore] recording stopped: {e}");
-                self.recorder = None;
-            }
+        if let Some(r) = &mut self.recorder
+            && let Err(e) = r.write(self.time_ns, header, &nodes, &edges, &s)
+        {
+            eprintln!("[YggdrasilStore] recording stopped: {e}");
+            self.recorder = None;
         }
         Ok(ffi::TypedStats {
             nodes: self.inner.num_nodes(),
@@ -307,7 +307,10 @@ impl TypedStore {
         // A path ending in .gz is gzip-compressed (about 6x smaller); each update is flushed
         // so a run stopped with Ctrl-C still leaves every finished update readable.
         let out: Box<dyn std::io::Write + Send> = if path.ends_with(".gz") {
-            Box::new(flate2::write::GzEncoder::new(file, flate2::Compression::fast()))
+            Box::new(flate2::write::GzEncoder::new(
+                file,
+                flate2::Compression::fast(),
+            ))
         } else {
             Box::new(file)
         };

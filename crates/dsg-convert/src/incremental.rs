@@ -276,7 +276,9 @@ impl Mirror {
         }
         features.push(Feature::new(F_ATTRS, &state.attrs));
         let anon = match state.pos {
-            Some([x, y, z]) => self.sg.new_coordinates(x as f32, y as f32, z as f32, features),
+            Some([x, y, z]) => self
+                .sg
+                .new_coordinates(x as f32, y as f32, z as f32, features),
             None => self.sg.new_node(features),
         };
         let lid = self.layer_keys[&state.key];
@@ -305,7 +307,9 @@ impl Mirror {
             self.sg.detach(nid).from(p).unwrap();
         }
         // A parent's bounds also cover its children, so rebuild them the way nesting would.
-        let coord = state.pos.map(|[x, y, z]| Coordinate::new(x as f32, y as f32, z as f32));
+        let coord = state
+            .pos
+            .map(|[x, y, z]| Coordinate::new(x as f32, y as f32, z as f32));
         let bounds = moved.then(|| {
             let node = self.sg.node(nid).unwrap();
             node.children()

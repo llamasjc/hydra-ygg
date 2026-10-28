@@ -20,9 +20,9 @@ pub mod delta;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use dsg_convert::LayerKey;
 use dsg_convert::incremental::HYDRA_LAYERS;
 use dsg_convert::topology::Topology;
-use dsg_convert::LayerKey;
 use scene_graph::{Coordinate, Feature, NodeId, PosQueryCount, SceneGraph};
 use serde_json::{Value, json};
 
@@ -168,7 +168,11 @@ fn distance(p: [f64; 3], q: [f64; 3]) -> f64 {
 /// Node -> kept node from candidate (distance, node, kept node) pairs, nearest pairs first.
 /// With `max_matching`, unmatched nodes then take a kept node along augmenting paths, nearest
 /// candidates first, so the number of merges is the largest possible.
-fn assign(mut pairs: Vec<(f64, u64, u64)>, one_to_one: bool, max_matching: bool) -> BTreeMap<u64, u64> {
+fn assign(
+    mut pairs: Vec<(f64, u64, u64)>,
+    one_to_one: bool,
+    max_matching: bool,
+) -> BTreeMap<u64, u64> {
     pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     let mut out = BTreeMap::new();
     let mut taken: HashMap<u64, u64> = HashMap::new();
@@ -187,7 +191,11 @@ fn assign(mut pairs: Vec<(f64, u64, u64)>, one_to_one: bool, max_matching: bool)
     for &(_, id, to) in &pairs {
         adj.entry(id).or_default().push(to);
     }
-    let free: Vec<u64> = adj.keys().copied().filter(|id| !out.contains_key(id)).collect();
+    let free: Vec<u64> = adj
+        .keys()
+        .copied()
+        .filter(|id| !out.contains_key(id))
+        .collect();
     for start in free {
         let mut seen: HashSet<u64> = HashSet::new();
         let mut stack: Vec<(u64, usize)> = vec![(start, 0)];
@@ -246,7 +254,12 @@ impl ObjectIndex {
                 l
             }
         };
-        let anon = self.sg.new_coordinates(p[0] as f32, p[1] as f32, p[2] as f32, vec![Feature::new("id", id)]);
+        let anon = self.sg.new_coordinates(
+            p[0] as f32,
+            p[1] as f32,
+            p[2] as f32,
+            vec![Feature::new("id", id)],
+        );
         let nid = self.sg.layer_mut(lid).unwrap().push_node(anon).unwrap();
         self.ygg.insert(id, nid);
         self.global.insert(nid, id);
@@ -272,7 +285,11 @@ impl ObjectIndex {
             .layer(*lid)
             .unwrap()
             // Yggdrasil stores f32: search a hair wider, callers measure exact f64 distances
-            .nodes_within(&Coordinate::new(p[0] as f32, p[1] as f32, p[2] as f32), radius as f32 + 1e-3, PosQueryCount::All)
+            .nodes_within(
+                &Coordinate::new(p[0] as f32, p[1] as f32, p[2] as f32),
+                radius as f32 + 1e-3,
+                PosQueryCount::All,
+            )
             .into_iter()
             .map(|(nid, d)| (self.global[&nid], d as f64))
             .collect()
@@ -372,14 +389,12 @@ impl Station {
     pub fn alignment_points(&self, robot: u8) -> (Vec<align::Labelled>, Vec<align::Labelled>) {
         let (mut mine, mut theirs) = self.alignment_objects(robot);
         let r = &self.robots[&robot];
-        mine.extend(described_places(&r.decoder.nodes, r.decoder.edges.keys(), |id| *id));
-        let lower: HashMap<u64, Value> = self
-            .nodes
-            .iter()
-            .filter(|(id, _)| robot_of(**id) < robot)
-            .map(|(id, n)| (*id, n.clone()))
-            .collect();
-        theirs.extend(described_places(&lower, self.raw_edges.keys(), |id| *id));
+        mine.extend(described_places(
+            |id| r.decoder.nodes.get(&id),
+            r.decoder.edges.keys(),
+        ));
+        let lower = |id: u64| self.nodes.get(&id).filter(|_| robot_of(id) < robot);
+        theirs.extend(described_places(lower, self.raw_edges.keys()));
         (mine, theirs)
     }
 
@@ -467,7 +482,8 @@ impl Station {
         let mut dirty: BTreeSet<(u8, String)> = BTreeSet::new();
         let ids: Vec<u64> = self.objects.pos.keys().copied().collect();
         for id in ids {
-            let (Some(raw), Some(c)) = (self.nodes.get(&id).and_then(position), corrected.get(&id)) else {
+            let (Some(raw), Some(c)) = (self.nodes.get(&id).and_then(position), corrected.get(&id))
+            else {
                 continue;
             };
             let offset = [c[0] - raw[0], c[1] - raw[1], c[2] - raw[2]];
@@ -510,7 +526,12 @@ impl Station {
         let mut touched_nodes: BTreeSet<u64> = BTreeSet::new();
         let mut touched_edges: BTreeSet<EdgeKey> = BTreeSet::new();
         // Merge groups whose matching must be worked out again, in robot order (`dirty`).
-        let later: Vec<u8> = self.robots.keys().copied().filter(|r| *r >= robot).collect();
+        let later: Vec<u8> = self
+            .robots
+            .keys()
+            .copied()
+            .filter(|r| *r >= robot)
+            .collect();
 
         // 1. robot nodes, in the station frame
         for &local in node_ids {
@@ -722,15 +743,21 @@ impl Station {
     /// Every robot node's position after drift correction ([`deform`]), with the merges of
     /// `closure_layers` as loop closures.
     pub fn corrected_positions(&self, closure_layers: &[LayerKey]) -> HashMap<u64, [f64; 3]> {
-        let positions: HashMap<u64, [f64; 3]> =
-            self.nodes.iter().filter_map(|(id, n)| Some((*id, position(n)?))).collect();
+        let positions: HashMap<u64, [f64; 3]> = self
+            .nodes
+            .iter()
+            .filter_map(|(id, n)| Some((*id, position(n)?)))
+            .collect();
         let edges: Vec<EdgeKey> = self.raw_edges.keys().copied().collect();
         deform::correct(
             &positions,
             &edges,
             &self.merges,
             robot_of,
-            |id| self.layer_of_robot_node(id).is_some_and(|l| closure_layers.contains(&l)),
+            |id| {
+                self.layer_of_robot_node(id)
+                    .is_some_and(|l| closure_layers.contains(&l))
+            },
             deform::SWEEPS,
         )
     }
@@ -740,10 +767,10 @@ impl Station {
         let pos = self.corrected_positions(closure_layers);
         let mut g = self.export();
         for n in g["nodes"].as_array_mut().into_iter().flatten() {
-            if let Some(p) = n["id"].as_u64().and_then(|id| pos.get(&id)) {
-                if n["attributes"]["position"].is_array() {
-                    n["attributes"]["position"] = json!(p);
-                }
+            if let Some(p) = n["id"].as_u64().and_then(|id| pos.get(&id))
+                && n["attributes"]["position"].is_array()
+            {
+                n["attributes"]["position"] = json!(p);
             }
         }
         g
@@ -839,7 +866,9 @@ impl Station {
                 continue;
             }
             // the station edge keeps the info of its smallest robot edge
-            out_edges.entry(edge_key(s, t)).or_insert_with(|| info.clone());
+            out_edges
+                .entry(edge_key(s, t))
+                .or_insert_with(|| info.clone());
         }
         for from in merges.keys() {
             nodes.remove(from);
@@ -859,14 +888,13 @@ impl Station {
 /// Rooms of different robots that share places after the place merge are one room. A room joins
 /// another when at least half of the smaller room's places are shared. The joined room keeps the
 /// Places with at least one object attached, labelled by the sorted labels of those objects.
-fn described_places<'a>(
-    nodes: &HashMap<u64, Value>,
+fn described_places<'a, 'n>(
+    node: impl Fn(u64) -> Option<&'n Value>,
     edges: impl Iterator<Item = &'a EdgeKey>,
-    id: impl Fn(&u64) -> u64,
 ) -> Vec<align::Labelled> {
     let mut labels: BTreeMap<u64, Vec<String>> = BTreeMap::new();
     for (a, b) in edges {
-        let (Some(na), Some(nb)) = (nodes.get(&id(a)), nodes.get(&id(b))) else {
+        let (Some(na), Some(nb)) = (node(*a), node(*b)) else {
             continue;
         };
         for (p, o) in [(na, nb), (nb, na)] {
@@ -882,7 +910,7 @@ fn described_places<'a>(
         .into_iter()
         .filter_map(|(pid, mut l)| {
             l.sort();
-            let n = nodes.get(&pid)?;
+            let n = node(pid)?;
             Some((format!("place:{}", l.join(",")), position(n)?))
         })
         .collect()
@@ -892,7 +920,12 @@ fn described_places<'a>(
 pub fn merge_rooms_by_places(graph: &mut Value) -> usize {
     const ROOMS: (i64, i64) = (4, 0);
     const PLACES: (i64, i64) = (3, 0);
-    let key = |n: &Value| (n["layer"].as_i64().unwrap_or(-1), n["partition"].as_i64().unwrap_or(0));
+    let key = |n: &Value| {
+        (
+            n["layer"].as_i64().unwrap_or(-1),
+            n["partition"].as_i64().unwrap_or(0),
+        )
+    };
     let mut kind: BTreeMap<u64, (i64, i64)> = BTreeMap::new();
     for n in graph["nodes"].as_array().unwrap() {
         kind.insert(n["id"].as_u64().unwrap(), key(n));
@@ -947,7 +980,10 @@ pub fn merge_rooms_by_places(graph: &mut Value) -> usize {
     let mut members: BTreeMap<u64, std::collections::BTreeSet<u64>> = BTreeMap::new();
     for r in &rooms {
         let root = into.get(r).copied().unwrap_or(*r);
-        members.entry(root).or_default().extend(places_of[r].iter().copied());
+        members
+            .entry(root)
+            .or_default()
+            .extend(places_of[r].iter().copied());
     }
     let pos: BTreeMap<u64, [f64; 3]> = graph["nodes"]
         .as_array()
@@ -955,7 +991,10 @@ pub fn merge_rooms_by_places(graph: &mut Value) -> usize {
         .iter()
         .filter_map(|n| {
             let p = n["attributes"]["position"].as_array()?;
-            Some((n["id"].as_u64()?, [p[0].as_f64()?, p[1].as_f64()?, p[2].as_f64()?]))
+            Some((
+                n["id"].as_u64()?,
+                [p[0].as_f64()?, p[1].as_f64()?, p[2].as_f64()?],
+            ))
         })
         .collect();
 
@@ -966,10 +1005,15 @@ pub fn merge_rooms_by_places(graph: &mut Value) -> usize {
         if !into.values().any(|r| *r == id) {
             continue;
         }
-        let ps: Vec<[f64; 3]> = members[&id].iter().filter_map(|p| pos.get(p).copied()).collect();
+        let ps: Vec<[f64; 3]> = members[&id]
+            .iter()
+            .filter_map(|p| pos.get(p).copied())
+            .collect();
         if !ps.is_empty() {
             let k = ps.len() as f64;
-            let mean: Vec<f64> = (0..3).map(|i| ps.iter().map(|p| p[i]).sum::<f64>() / k).collect();
+            let mean: Vec<f64> = (0..3)
+                .map(|i| ps.iter().map(|p| p[i]).sum::<f64>() / k)
+                .collect();
             n["attributes"]["position"] = serde_json::json!(mean);
         }
     }
@@ -1058,7 +1102,11 @@ mod tests {
         station.receive(0, &ea.encode(&a2)).unwrap();
         check(&station);
         assert!(station.merges.is_empty());
-        assert!(station.topology.has_edge(global_id(1, p(1)), global_id(1, o(1))));
+        assert!(
+            station
+                .topology
+                .has_edge(global_id(1, p(1)), global_id(1, o(1)))
+        );
 
         // drift correction keeps the incremental graph equal to the reference
         station.correct_drift(&[OBJECTS, PLACES, ROOMS]);

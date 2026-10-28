@@ -32,11 +32,11 @@ pub fn offsets(
     let index: HashMap<u64, usize> = nodes.iter().enumerate().map(|(i, n)| (*n, i)).collect();
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
     for (a, b) in edges {
-        if let (Some(&i), Some(&j)) = (index.get(a), index.get(b)) {
-            if i != j {
-                adj[i].push(j);
-                adj[j].push(i);
-            }
+        if let (Some(&i), Some(&j)) = (index.get(a), index.get(b))
+            && i != j
+        {
+            adj[i].push(j);
+            adj[j].push(i);
         }
     }
     let target: Vec<Option<[f64; 3]>> = nodes.iter().map(|n| closures.get(n).copied()).collect();
@@ -226,8 +226,17 @@ mod tests {
         }
         merges.insert(r1, 0);
         merges.insert(r1 | 20, 20);
-        let out = correct(&positions, &edges, &merges, |id| (id >> 48) as u8, |_| true, SWEEPS);
-        let worst = (0..21u64).map(|i| out[&(r1 | i)][1].abs()).fold(0.0, f64::max);
+        let out = correct(
+            &positions,
+            &edges,
+            &merges,
+            |id| (id >> 48) as u8,
+            |_| true,
+            SWEEPS,
+        );
+        let worst = (0..21u64)
+            .map(|i| out[&(r1 | i)][1].abs())
+            .fold(0.0, f64::max);
         assert!(worst < 0.01, "worst sideways error {worst} m (was 1.0 m)");
         assert_eq!(out[&5], [5.0, 0.0, 0.0]);
     }
@@ -251,8 +260,17 @@ mod tests {
         }
         positions.insert(100, [10.0, 3.0, 0.0]);
         merges.insert(r1 | 10, 100);
-        let out = correct(&positions, &edges, &merges, |id| (id >> 48) as u8, |_| true, SWEEPS);
-        let worst = (0..21u64).map(|i| out[&(r1 | i)][1].abs()).fold(0.0, f64::max);
+        let out = correct(
+            &positions,
+            &edges,
+            &merges,
+            |id| (id >> 48) as u8,
+            |_| true,
+            SWEEPS,
+        );
+        let worst = (0..21u64)
+            .map(|i| out[&(r1 | i)][1].abs())
+            .fold(0.0, f64::max);
         assert!(worst < 0.05, "worst sideways error {worst} m");
     }
 }

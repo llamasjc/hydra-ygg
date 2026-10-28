@@ -111,7 +111,10 @@ fn main() {
     let mut station = Station::new(config);
     let mut runs: Vec<Run> = Vec::new();
     for (r, f) in files.iter().enumerate() {
-        station.add_robot(r as u8, transforms.get(&(r as u8)).copied().unwrap_or_default());
+        station.add_robot(
+            r as u8,
+            transforms.get(&(r as u8)).copied().unwrap_or_default(),
+        );
         let file = File::open(f).unwrap_or_else(|e| panic!("{f}: {e}"));
         let input: Box<dyn Read> = if f.ends_with(".gz") {
             Box::new(flate2::read::MultiGzDecoder::new(file))
@@ -129,14 +132,11 @@ fn main() {
 
     let start = Instant::now();
     let (mut total_ms, mut max_ms, mut count) = (0.0f64, 0.0f64, 0usize);
-    loop {
-        // the robot whose next delta is earliest
-        let Some(r) = (0..runs.len())
-            .filter(|r| runs[*r].next.is_some())
-            .min_by_key(|r| runs[*r].next.as_ref().unwrap()["t"].as_u64().unwrap_or(0))
-        else {
-            break;
-        };
+    // the robot whose next delta is earliest, until every run is done
+    while let Some(r) = (0..runs.len())
+        .filter(|r| runs[*r].next.is_some())
+        .min_by_key(|r| runs[*r].next.as_ref().unwrap()["t"].as_u64().unwrap_or(0))
+    {
         let delta = runs[r].next.take().unwrap();
         let t = Instant::now();
         station.receive(r as u8, &delta).unwrap();
@@ -146,7 +146,7 @@ fn main() {
         count += 1;
         runs[r].deltas += 1;
         runs[r].advance();
-        if align && r > 0 && runs[r].deltas % 50 == 0 {
+        if align && r > 0 && runs[r].deltas.is_multiple_of(50) {
             try_align(&mut station, r as u8);
         }
         if count % 200 == 0 {
@@ -216,7 +216,8 @@ fn main() {
                     .iter()
                     .filter(|(o, _)| robot_of(*o) < robot_of(*id))
                     .map(|(_, q)| {
-                        ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt()
+                        ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2))
+                            .sqrt()
                     })
                     .min_by(|a, b| a.total_cmp(b))
             })
@@ -259,14 +260,25 @@ fn main() {
     // matching within the radius could merge (each earlier-robot node used once per robot).
     for rule in &rules {
         let nodes = station.robot_nodes(rule.layer);
-        let robots: std::collections::BTreeSet<u8> = nodes.iter().map(|(id, _)| robot_of(*id)).collect();
+        let robots: std::collections::BTreeSet<u8> =
+            nodes.iter().map(|(id, _)| robot_of(*id)).collect();
         let mut line = Vec::new();
         for r in robots.iter().filter(|r| **r > 0) {
-            let mine: Vec<[f64; 3]> =
-                nodes.iter().filter(|(id, _)| robot_of(*id) == *r).map(|(_, p)| *p).collect();
-            let theirs: Vec<[f64; 3]> =
-                nodes.iter().filter(|(id, _)| robot_of(*id) < *r).map(|(_, p)| *p).collect();
-            line.push(format!("robot {r}: {} nodes, at most {} mergeable", mine.len(), matching_ceiling(&mine, &theirs, rule.radius)));
+            let mine: Vec<[f64; 3]> = nodes
+                .iter()
+                .filter(|(id, _)| robot_of(*id) == *r)
+                .map(|(_, p)| *p)
+                .collect();
+            let theirs: Vec<[f64; 3]> = nodes
+                .iter()
+                .filter(|(id, _)| robot_of(*id) < *r)
+                .map(|(_, p)| *p)
+                .collect();
+            line.push(format!(
+                "robot {r}: {} nodes, at most {} mergeable",
+                mine.len(),
+                matching_ceiling(&mine, &theirs, rule.radius)
+            ));
         }
         println!("  layer {:?}: {}", rule.layer, line.join("; "));
     }
@@ -275,7 +287,12 @@ fn main() {
         report_deform(&station);
         // then match again on corrected positions, a few rounds (each correction uses the
         // merges the previous round found)
-        let count = |st: &Station, layer| st.merges.keys().filter(|id| st.layer_of_robot_node(**id) == Some(layer)).count();
+        let count = |st: &Station, layer| {
+            st.merges
+                .keys()
+                .filter(|id| st.layer_of_robot_node(**id) == Some(layer))
+                .count()
+        };
         for round in 1..=3 {
             let t = Instant::now();
             station.correct_drift(&[station::OBJECTS, station::PLACES, station::ROOMS]);
@@ -306,12 +323,17 @@ fn main() {
     }
 }
 
-
 /// Maximum one-to-one matching between `a` and `b` where pairs are within `radius` (Kuhn's
 /// augmenting paths, iterative).
 fn matching_ceiling(a: &[[f64; 3]], b: &[[f64; 3]], radius: f64) -> usize {
     let cell = radius.max(1e-6);
-    let key = |p: &[f64; 3]| ((p[0] / cell).floor() as i64, (p[1] / cell).floor() as i64, (p[2] / cell).floor() as i64);
+    let key = |p: &[f64; 3]| {
+        (
+            (p[0] / cell).floor() as i64,
+            (p[1] / cell).floor() as i64,
+            (p[2] / cell).floor() as i64,
+        )
+    };
     let mut grid: std::collections::HashMap<(i64, i64, i64), Vec<usize>> = Default::default();
     for (j, q) in b.iter().enumerate() {
         grid.entry(key(q)).or_default().push(j);
@@ -326,7 +348,10 @@ fn matching_ceiling(a: &[[f64; 3]], b: &[[f64; 3]], radius: f64) -> usize {
                     for dz in -1..=1 {
                         for &j in grid.get(&(x + dx, y + dy, z + dz)).into_iter().flatten() {
                             let q = b[j];
-                            let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
+                            let d = ((p[0] - q[0]).powi(2)
+                                + (p[1] - q[1]).powi(2)
+                                + (p[2] - q[2]).powi(2))
+                            .sqrt();
                             if d <= radius {
                                 out.push(j);
                             }
@@ -406,7 +431,12 @@ fn try_align(station: &mut Station, r: u8) {
 /// see how much closer each later robot's places sit to an earlier robot's places, and how many
 /// more could merge.
 fn report_deform(station: &Station) {
-    let rule = station.config.rules.iter().find(|r| r.layer == station::PLACES).cloned();
+    let rule = station
+        .config
+        .rules
+        .iter()
+        .find(|r| r.layer == station::PLACES)
+        .cloned();
     let Some(rule) = rule else { return };
     let before: std::collections::HashMap<u64, [f64; 3]> =
         station.robot_nodes(station::PLACES).into_iter().collect();
@@ -419,12 +449,23 @@ fn report_deform(station: &Station) {
         let mut ceiling = 0;
         let robots: std::collections::BTreeSet<u8> = ids.iter().map(|id| robot_of(*id)).collect();
         for r in robots.iter().filter(|r| **r > 0) {
-            let mine: Vec<[f64; 3]> = ids.iter().filter(|id| robot_of(**id) == *r).map(|id| pos(*id)).collect();
-            let theirs: Vec<[f64; 3]> = ids.iter().filter(|id| robot_of(**id) < *r).map(|id| pos(*id)).collect();
+            let mine: Vec<[f64; 3]> = ids
+                .iter()
+                .filter(|id| robot_of(**id) == *r)
+                .map(|id| pos(*id))
+                .collect();
+            let theirs: Vec<[f64; 3]> = ids
+                .iter()
+                .filter(|id| robot_of(**id) < *r)
+                .map(|id| pos(*id))
+                .collect();
             for p in &mine {
                 let m = theirs
                     .iter()
-                    .map(|q| ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt())
+                    .map(|q| {
+                        ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2))
+                            .sqrt()
+                    })
                     .fold(f64::INFINITY, f64::min);
                 if m.is_finite() {
                     d.push(m);
@@ -434,12 +475,22 @@ fn report_deform(station: &Station) {
         }
         d.sort_by(|a, b| a.total_cmp(b));
         let med = if d.is_empty() { 0.0 } else { d[d.len() / 2] };
-        let within = |x: f64| 100.0 * d.iter().filter(|v| **v <= x).count() as f64 / d.len().max(1) as f64;
-        format!("median {med:.2} m, within 0.3/0.5 m {:.0}/{:.0}%, at most {ceiling} mergeable", within(0.3), within(0.5))
+        let within =
+            |x: f64| 100.0 * d.iter().filter(|v| **v <= x).count() as f64 / d.len().max(1) as f64;
+        format!(
+            "median {med:.2} m, within 0.3/0.5 m {:.0}/{:.0}%, at most {ceiling} mergeable",
+            within(0.3),
+            within(0.5)
+        )
     };
-    println!("drift correction from object merges only ({ms:.0} ms), later robots' places to earlier robots':");
+    println!(
+        "drift correction from object merges only ({ms:.0} ms), later robots' places to earlier robots':"
+    );
     println!("  before: {}", summary(&|id| before[&id]));
     println!("  after:  {}", summary(&|id| after[&id]));
     let all = station.corrected_positions(&[station::OBJECTS, station::PLACES, station::ROOMS]);
-    println!("  with every merge as a loop closure: {}", summary(&|id| all[&id]));
+    println!(
+        "  with every merge as a loop closure: {}",
+        summary(&|id| all[&id])
+    );
 }

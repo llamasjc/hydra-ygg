@@ -34,9 +34,12 @@ pub struct Topology {
     pub rebuilds: usize,
 }
 
+/// A node as replayed into a new layout: id, layer, position and kept features.
+type SnapshotNode = (u64, LayerKey, Option<[f64; 3]>, Vec<Feature>);
+
 /// Everything needed to replay a graph into a new layout.
 struct Snapshot {
-    nodes: Vec<(u64, LayerKey, Option<[f64; 3]>, Vec<Feature>)>,
+    nodes: Vec<SnapshotNode>,
     edges: Vec<(u64, u64)>,
 }
 
@@ -83,7 +86,10 @@ impl Topology {
             let key = self.key_of_layer[&layer.id];
             for node in layer.all_nodes() {
                 let id = self.dsg_of[&node.id];
-                let pos = node.coordinates.first().map(|c| [c.x as f64, c.y as f64, c.z as f64]);
+                let pos = node
+                    .coordinates
+                    .first()
+                    .map(|c| [c.x as f64, c.y as f64, c.z as f64]);
                 let kept = node
                     .features
                     .iter()
@@ -133,7 +139,9 @@ impl Topology {
         }
         let features = vec![Feature::new(F_DSG_ID, id)];
         let anon = match pos {
-            Some([x, y, z]) => self.sg.new_coordinates(x as f32, y as f32, z as f32, features),
+            Some([x, y, z]) => self
+                .sg
+                .new_coordinates(x as f32, y as f32, z as f32, features),
             None => self.sg.new_node(features),
         };
         let nid = self

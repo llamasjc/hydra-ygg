@@ -35,7 +35,7 @@ fn prefix(g: &Value, fraction: f64, churn: u64) -> Value {
         .iter()
         .take(keep)
         .enumerate()
-        .filter(|(i, _)| churn == 0 || (*i as u64 * 2654435761 + churn) % 50 != 0)
+        .filter(|(i, _)| churn == 0 || !(*i as u64 * 2654435761 + churn).is_multiple_of(50))
         .map(|(_, n)| n.clone())
         .collect();
     let ids: HashSet<u64> = kept.iter().map(|n| n["id"].as_u64().unwrap()).collect();
@@ -175,7 +175,11 @@ fn main() {
             objects_ok = right == ids.len() && wrong == 0;
         }
     }
-    let stray = station.merges.keys().filter(|from| robot_of(**from) != 1).count();
+    let stray = station
+        .merges
+        .keys()
+        .filter(|from| robot_of(**from) != 1)
+        .count();
     println!(
         "sent: deltas {:.1} MB vs full graphs {:.1} MB ({:.0}% saved), {:.2} s",
         delta_bytes as f64 / 1e6,

@@ -17,6 +17,8 @@ pub type Labelled = (String, [f64; 3]);
 const PAIR_TOLERANCE: f64 = 0.15;
 /// Matches closer together than this (m, horizontally) give a poor rotation.
 const MIN_BASELINE: f64 = 1.0;
+/// Points a hypothesis is first scored on.
+const SAMPLE: usize = 24;
 /// At most this many candidate transforms are scored.
 const MAX_HYPOTHESES: usize = 200_000;
 
@@ -33,7 +35,13 @@ pub fn estimate(from: &[Labelled], to: &[Labelled], radius: f64) -> Option<(Tran
         }
     }
 
+    // Most hypotheses are wrong; score each on an evenly spread sample first and only count all
+    // points for those that could beat the best so far.
+    let step = (from.len() / SAMPLE).max(1);
+    let sample: Vec<Labelled> = from.iter().step_by(step).cloned().collect();
+    let (from_ids, sample_ids) = (index.label_ids(from), index.label_ids(&sample));
     let mut best: Option<(Transform, usize)> = None;
+    let mut best_sample = 0usize;
     let mut tried = 0;
     'outer: for (k, &(i1, j1)) in matches.iter().enumerate() {
         for &(i2, j2) in &matches[k + 1..] {
@@ -51,9 +59,13 @@ pub fn estimate(from: &[Labelled], to: &[Labelled], radius: f64) -> Option<(Tran
             }
             let yaw = (b2[1] - b1[1]).atan2(b2[0] - b1[0]) - (a2[1] - a1[1]).atan2(a2[0] - a1[0]);
             let t = from_rotation(yaw, a1, b1);
-            let score = index.inliers(from, &t).len();
-            if best.as_ref().is_none_or(|b| score > b.1) {
-                best = Some((t, score));
+            let quick = index.count(&sample, &sample_ids, &t);
+            if quick * 4 >= best_sample * 3 {
+                let score = index.count(from, &from_ids, &t);
+                if best.as_ref().is_none_or(|b| score > b.1) {
+                    best = Some((t, score));
+                }
+                best_sample = best_sample.max(quick);
             }
             tried += 1;
             if tried >= MAX_HYPOTHESES {
@@ -69,7 +81,12 @@ pub fn estimate(from: &[Labelled], to: &[Labelled], radius: f64) -> Option<(Tran
         if pairs.len() < 2 {
             break;
         }
-        t = least_squares(&pairs.iter().map(|(i, j)| (from[*i].1, to[*j].1)).collect::<Vec<_>>());
+        t = least_squares(
+            &pairs
+                .iter()
+                .map(|(i, j)| (from[*i].1, to[*j].1))
+                .collect::<Vec<_>>(),
+        );
     }
     let score = index.inliers(from, &t).len();
     Some((t, score))
@@ -100,7 +117,8 @@ fn from_rotation(yaw: f64, a: [f64; 3], b: [f64; 3]) -> Transform {
 /// The yaw and translation that best take each `.0` onto its `.1`.
 fn least_squares(pairs: &[([f64; 3], [f64; 3])]) -> Transform {
     let n = pairs.len() as f64;
-    let mean = |f: &dyn Fn(&([f64; 3], [f64; 3])) -> [f64; 3]| {
+    type Pair = ([f64; 3], [f64; 3]);
+    let mean = |f: &dyn Fn(&Pair) -> [f64; 3]| {
         let mut m = [0.0; 3];
         for p in pairs {
             let v = f(p);
@@ -122,65 +140,123 @@ fn least_squares(pairs: &[([f64; 3], [f64; 3])]) -> Transform {
     from_rotation(sin.atan2(cos), ma, mb)
 }
 
-/// Labelled points bucketed by cell, for "is there a same-label point within radius".
+/// Labelled points bucketed in a dense 2D grid of cells one radius wide (compressed rows), for
+/// "is there a same-label point within radius". Labels are interned to integers so the hot loop
+/// compares numbers, not strings.
 struct Grid<'a> {
     points: &'a [Labelled],
-    cell: f64,
+    labels: HashMap<&'a str, u32>,
+    point_label: Vec<u32>,
     radius: f64,
-    cells: HashMap<(i64, i64, i64), Vec<usize>>,
+    origin: [f64; 2],
+    size: [i64; 2],
+    /// cell c holds points[order[start[c]..start[c + 1]]]
+    start: Vec<u32>,
+    order: Vec<u32>,
 }
 
 impl<'a> Grid<'a> {
     fn new(points: &'a [Labelled], radius: f64) -> Self {
-        let cell = radius.max(1e-3);
-        let mut cells: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+        let radius = radius.max(1e-3);
+        let mut labels: HashMap<&str, u32> = HashMap::new();
+        let point_label: Vec<u32> = points
+            .iter()
+            .map(|(l, _)| {
+                let n = labels.len() as u32;
+                *labels.entry(l.as_str()).or_insert(n)
+            })
+            .collect();
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for (_, p) in points {
+            for k in 0..2 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        if points.is_empty() {
+            (lo, hi) = ([0.0; 2], [0.0; 2]);
+        }
+        let size = [0, 1].map(|k| ((hi[k] - lo[k]) / radius).floor() as i64 + 1);
+        let cell_of = |p: &[f64; 3]| {
+            let x = ((p[0] - lo[0]) / radius).floor() as i64;
+            let y = ((p[1] - lo[1]) / radius).floor() as i64;
+            (y * size[0] + x) as usize
+        };
+        let cells = (size[0] * size[1]) as usize;
+        let mut start = vec![0u32; cells + 1];
+        for (_, p) in points {
+            start[cell_of(p) + 1] += 1;
+        }
+        for c in 0..cells {
+            start[c + 1] += start[c];
+        }
+        let mut fill = start.clone();
+        let mut order = vec![0u32; points.len()];
         for (j, (_, p)) in points.iter().enumerate() {
-            cells.entry(Self::key(cell, p)).or_default().push(j);
+            let c = cell_of(p);
+            order[fill[c] as usize] = j as u32;
+            fill[c] += 1;
         }
         Grid {
             points,
-            cell,
+            labels,
+            point_label,
             radius,
-            cells,
+            origin: lo,
+            size,
+            start,
+            order,
         }
     }
 
-    fn key(cell: f64, p: &[f64; 3]) -> (i64, i64, i64) {
-        (
-            (p[0] / cell).floor() as i64,
-            (p[1] / cell).floor() as i64,
-            (p[2] / cell).floor() as i64,
-        )
+    fn label_ids(&self, from: &[Labelled]) -> Vec<Option<u32>> {
+        from.iter()
+            .map(|(l, _)| self.labels.get(l.as_str()).copied())
+            .collect()
+    }
+
+    /// The nearest same-label point within the radius of `q`, with its squared distance.
+    fn nearest(&self, label: u32, q: [f64; 3]) -> Option<(f64, usize)> {
+        let r2 = self.radius * self.radius;
+        let cx = ((q[0] - self.origin[0]) / self.radius).floor() as i64;
+        let cy = ((q[1] - self.origin[1]) / self.radius).floor() as i64;
+        let mut best: Option<(f64, usize)> = None;
+        for y in (cy - 1).max(0)..=(cy + 1).min(self.size[1] - 1) {
+            for x in (cx - 1).max(0)..=(cx + 1).min(self.size[0] - 1) {
+                let c = (y * self.size[0] + x) as usize;
+                for &j in &self.order[self.start[c] as usize..self.start[c + 1] as usize] {
+                    let j = j as usize;
+                    if self.point_label[j] != label {
+                        continue;
+                    }
+                    let r = self.points[j].1;
+                    let d = (q[0] - r[0]).powi(2) + (q[1] - r[1]).powi(2) + (q[2] - r[2]).powi(2);
+                    if d <= r2 && best.is_none_or(|b| d < b.0) {
+                        best = Some((d, j));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// How many points of `from` (labels from [`Grid::label_ids`]) land within the radius of a
+    /// same-label point under `t`.
+    fn count(&self, from: &[Labelled], ids: &[Option<u32>], t: &Transform) -> usize {
+        from.iter()
+            .zip(ids)
+            .filter(|((_, p), id)| id.is_some_and(|l| self.nearest(l, t.apply(*p)).is_some()))
+            .count()
     }
 
     /// Each point of `from` under `t` with its nearest same-label point within the radius.
     fn inliers(&self, from: &[Labelled], t: &Transform) -> Vec<(usize, usize)> {
-        let mut out = Vec::new();
-        for (i, (label, p)) in from.iter().enumerate() {
-            let q = t.apply(*p);
-            let (x, y, z) = Self::key(self.cell, &q);
-            let mut best: Option<(f64, usize)> = None;
-            for dx in -1..=1 {
-                for dy in -1..=1 {
-                    for dz in -1..=1 {
-                        for &j in self.cells.get(&(x + dx, y + dy, z + dz)).into_iter().flatten() {
-                            let (l, r) = &self.points[j];
-                            if l != label {
-                                continue;
-                            }
-                            let d = ((q[0] - r[0]).powi(2) + (q[1] - r[1]).powi(2) + (q[2] - r[2]).powi(2)).sqrt();
-                            if d <= self.radius && best.is_none_or(|b| d < b.0) {
-                                best = Some((d, j));
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some((_, j)) = best {
-                out.push((i, j));
-            }
-        }
-        out
+        let ids = self.label_ids(from);
+        from.iter()
+            .zip(&ids)
+            .enumerate()
+            .filter_map(|(i, ((_, p), id))| Some((i, self.nearest((*id)?, t.apply(*p))?.1)))
+            .collect()
     }
 }
 
@@ -194,11 +270,16 @@ mod tests {
         let mut to = Vec::new();
         let mut seed = 7u64;
         let mut rnd = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as f64 / (1u64 << 31) as f64
         };
         for k in 0..60 {
-            to.push((format!("{}", k % 7), [rnd() * 30.0, rnd() * 20.0, rnd() * 2.0]));
+            to.push((
+                format!("{}", k % 7),
+                [rnd() * 30.0, rnd() * 20.0, rnd() * 2.0],
+            ));
         }
         let truth = Transform {
             yaw: 0.9,
@@ -213,7 +294,11 @@ mod tests {
                 let (x, y) = (p[0] - truth.translation[0], p[1] - truth.translation[1]);
                 (
                     l.clone(),
-                    [c * x + s * y + 0.02 * rnd(), -s * x + c * y - 0.02 * rnd(), p[2] - truth.translation[2]],
+                    [
+                        c * x + s * y + 0.02 * rnd(),
+                        -s * x + c * y - 0.02 * rnd(),
+                        p[2] - truth.translation[2],
+                    ],
                 )
             })
             .collect();
@@ -222,7 +307,10 @@ mod tests {
         assert!(n >= 44, "{n} inliers");
         assert!((t.yaw - truth.yaw).abs() < 0.01, "{t:?}");
         for k in 0..3 {
-            assert!((t.translation[k] - truth.translation[k]).abs() < 0.05, "{t:?}");
+            assert!(
+                (t.translation[k] - truth.translation[k]).abs() < 0.05,
+                "{t:?}"
+            );
         }
     }
 }

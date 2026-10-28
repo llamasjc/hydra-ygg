@@ -36,7 +36,9 @@ fn main() {
     };
     let flag = |name: &str| args.iter().any(|a| a == name);
     let Some(robots) = value("--robots").map(|v| v.parse::<u8>().unwrap()) else {
-        eprintln!("usage: station_server --robots N [--port 7447] [--align] [--deform] [--rooms] [--max-matching] [--out station.json] [--dsg-out station_dsg.json] [--every 5]");
+        eprintln!(
+            "usage: station_server --robots N [--port 7447] [--align] [--deform] [--rooms] [--max-matching] [--out station.json] [--dsg-out station_dsg.json] [--every 5]"
+        );
         std::process::exit(2);
     };
     let port: u16 = value("--port").map_or(7447, |v| v.parse().unwrap());
@@ -47,8 +49,10 @@ fn main() {
     let deform = flag("--deform");
     let rooms = flag("--rooms");
 
-    let mut config = Config::default();
-    config.max_matching = flag("--max-matching");
+    let config = Config {
+        max_matching: flag("--max-matching"),
+        ..Default::default()
+    };
     let rules = config.rules.clone();
     let mut station = Station::new(config);
 
@@ -62,7 +66,10 @@ fn main() {
         std::thread::spawn(move || {
             // one connection per robot run; a reconnect continues the same robot
             for stream in listener.incoming().flatten() {
-                let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+                let peer = stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
                 tx.send(Event::Connected(r, peer)).ok();
                 for line in BufReader::new(stream).lines() {
                     let Ok(line) = line else { break };
@@ -96,7 +103,7 @@ fn main() {
                 count += 1;
                 let n = deltas.entry(r).or_default();
                 *n += 1;
-                if align && r > 0 && *n % 50 == 0 {
+                if align && r > 0 && (*n).is_multiple_of(50) {
                     try_align(&mut station, r);
                 }
             }
@@ -128,10 +135,11 @@ fn report(station: &Station, deltas: &BTreeMap<u8, usize>, rules: &[station::Mer
             format!("{:?} {n}", rule.layer)
         })
         .collect();
-    let per_robot: BTreeMap<u8, usize> = station.merges.keys().fold(BTreeMap::new(), |mut m, id| {
-        *m.entry(robot_of(*id)).or_default() += 1;
-        m
-    });
+    let per_robot: BTreeMap<u8, usize> =
+        station.merges.keys().fold(BTreeMap::new(), |mut m, id| {
+            *m.entry(robot_of(*id)).or_default() += 1;
+            m
+        });
     println!(
         "deltas {deltas:?}: station nodes={} edges={}, merged {} (per robot {per_robot:?}), {ms:.1} ms per delta",
         station.num_nodes(),
@@ -150,7 +158,9 @@ fn write(station: &Station, path: &str, dsg: Option<&str>, deform: bool, rooms: 
         station.export()
     };
     station::merge_rooms_by_places(&mut graph);
-    if let Err(e) = std::fs::write(&tmp, graph.to_string()).and_then(|_| std::fs::rename(&tmp, path)) {
+    if let Err(e) =
+        std::fs::write(&tmp, graph.to_string()).and_then(|_| std::fs::rename(&tmp, path))
+    {
         eprintln!("{path}: {e}");
         return;
     }

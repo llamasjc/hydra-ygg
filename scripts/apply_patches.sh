@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply the hydra-ygg patches to Hydra and spark_dsg in a colcon workspace; patches already
+# Apply the hydra-yggdrasil patches to Hydra and spark_dsg in a colcon workspace; patches already
 # applied are skipped. Usage: apply_patches.sh <workspace src dir, e.g. /root/hydra_ws/src>
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
@@ -7,14 +7,14 @@ src="${1:?usage: $0 <workspace src dir>}"
 
 find_repo() {  # $1: a file that only that repo has
   local f
-  f="$(find "$src" -path "*/$1" -not -path "*/hydra-ygg/*" | head -1)"
+  f="$(find "$src" -path "*/$1" -not -path "*/hydra-yggdrasil/*" | head -1)"
   [ -n "$f" ] || { echo "cannot find $1 under $src" >&2; exit 1; }
   git -C "$(dirname "$f")" rev-parse --show-toplevel
 }
 
-apply() {  # $1: repo dir, $2: patch dir. Applied patches are listed in .git/hydra-ygg-patches.
+apply() {  # $1: repo dir, $2: patch dir. Applied patches are listed in .git/hydra-yggdrasil-patches.
   local stamp
-  stamp="$(git -C "$1" rev-parse --absolute-git-dir)/hydra-ygg-patches"
+  stamp="$(git -C "$1" rev-parse --absolute-git-dir)/hydra-yggdrasil-patches"
   touch "$stamp"
   for p in "$2"/*.patch; do
     local name

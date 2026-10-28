@@ -273,6 +273,25 @@ fn main() {
 
     if deform {
         report_deform(&station);
+        // then match again on corrected positions, a few rounds (each correction uses the
+        // merges the previous round found)
+        let count = |st: &Station, layer| st.merges.keys().filter(|id| st.layer_of_robot_node(**id) == Some(layer)).count();
+        for round in 1..=3 {
+            let t = Instant::now();
+            station.correct_drift(&[station::OBJECTS, station::PLACES, station::ROOMS]);
+            println!(
+                "  re-merge round {round} ({:.0} ms): objects {}, places {}, rooms {} merged",
+                t.elapsed().as_secs_f64() * 1e3,
+                count(&station, station::OBJECTS),
+                count(&station, station::PLACES),
+                count(&station, station::ROOMS)
+            );
+        }
+        let (_, reference) = station.merged_graph();
+        println!(
+            "  incremental merges equal the full rebuild after correction: {}",
+            reference == station.merges
+        );
     }
     let mut graph = if deform {
         station.export_corrected(&[station::OBJECTS, station::PLACES, station::ROOMS])

@@ -76,7 +76,7 @@ pub fn import(input: &Value) -> (SceneGraph, BTreeMap<LayerKey, u32>, Report) {
         let anon = match position.as_ref().and_then(Value::as_array) {
             Some(p) => {
                 let c: Vec<f64> = p.iter().map(|v| v.as_f64().unwrap()).collect();
-                sg.new_coordinates(c[0], c[1], c[2], features)
+                sg.new_coordinates(c[0] as f32, c[1] as f32, c[2] as f32, features)
             }
             None => {
                 report.no_position += 1;

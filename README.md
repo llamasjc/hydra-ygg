@@ -1,25 +1,9 @@
-# hydra-ygg
+# hydra-yggdrasil
 
 Run [Hydra](https://github.com/MIT-SPARK/Hydra) and Hydra-Multi on top of the Yggdrasil scene graph.
-Yggdrasil is the public version (rev 3b17a94) with positions switched from f32 to f64, vendored in
-`third_party/yggdrasil-f64` (only `f32` -> `f64` and `Vec3` -> `DVec3`; its tests pass). Hydra and spark_dsg get small patches (`patches/`) that let
+Yggdrasil is used unmodified, straight from [upstream](https://github.com/brdsdsu/Yggdrasil)
+(rev 3b17a94). Hydra and spark_dsg get small patches (`patches/`) that let
 Hydra's backend keep its scene graph in Yggdrasil.
-
-## Overview
-
-The repo has two parts:
-
-1. **Hydra on Yggdrasil (single robot).** Hydra runs as usual, but its scene graph is stored
-   in Yggdrasil (`ros/hydra_ygg_sink`, `crates/ygg-bridge`, `crates/dsg-convert`, `patches/`).
-   Switched with `HYDRA_GRAPH_BACKEND=spark|yggdrasil|both`. See "Hydra backend on Yggdrasil".
-2. **Hydra-Multi on Yggdrasil (several robots).** Each Hydra streams its graph changes
-   (`HYDRA_YGG_RECORD=file` or `tcp://host:port`) to a station (`crates/station`) that aligns the
-   robots' frames, merges what they both saw, and corrects drift (`--align`, `--deform`). Run it
-   offline with `replay` or live with `station_server`; `scripts/live3.sh` starts a 3-robot run.
-   See "Hydra-Multi station".
-
-Other scripts: `scripts/record3d_wifi/` and `scripts/r3d_to_bag.py` feed Hydra from an iPhone
-(Record3D); `scripts/uh2_labels.py` handles uHumans2 labels.
 
 ## Layout
 
@@ -27,6 +11,7 @@ Other scripts: `scripts/record3d_wifi/` and `scripts/r3d_to_bag.py` feed Hydra f
 |---|---|
 | `crates/dsg-convert` | Spark-DSG JSON <-> Yggdrasil `SceneGraph`, lossless |
 | `crates/tools` | `roundtrip` binary and `compare.py` |
+| planned: `crates/ygg-bridge` | C++-facing API (cxx) that Hydra's sink calls |
 | `crates/station` | robot deltas and the multi-robot station graph |
 | `crates/ygg-bridge` | cxx bridge: Rust mirror API callable from C++ |
 | `ros/hydra_ygg_sink` | colcon package: `YggdrasilStore` for the patched backend, and `ygg_mirror_node` |
@@ -56,7 +41,7 @@ python3 crates/tools/compare.py path/to/dsg.json /tmp/rt.json   # expect ROUND T
 ```
 
 On the stock-Hydra uH2 office baseline (5,156 nodes, 15,566 edges) this gives 0 differences and
-no position change (f64 coordinates; 1.9 µm with upstream f32).
+no position change.
 
 ## Known mapping gaps
 
@@ -188,5 +173,11 @@ share one world frame.
 Live: `station_server --robots N [--align] [--deform] [--out station.json] [--dsg-out dsg.json]`
 listens on port 7447 + robot; each Hydra runs with `HYDRA_YGG_RECORD=tcp://<host>:<port>`.
 
-Not yet: merging again on the corrected positions (correction only moves nodes), and rooms
-re-segmented on the merged places.
+After correcting, the station matches again on the corrected positions
+(`Station::correct_drift`; `replay --deform` runs three rounds, `station_server --deform` one per
+report), so nodes drift had kept apart merge too. On the bent run: objects 28 to 53 merged, places
+1,044 to 1,097; the incremental result still equals the full rebuild.
+
+Not yet: rooms re-segmented on the merged places (rooms of different robots are joined when they
+share places), and loop closures found from place descriptors when maps start too far apart for
+object alignment.

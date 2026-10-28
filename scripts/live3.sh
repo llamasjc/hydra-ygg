@@ -8,7 +8,7 @@ BAGS=(/datasets/hydra_office_mcap /datasets/office06_mcap /datasets/office12_mca
 source /root/hydra_ws/install/setup.bash
 pkill -9 -f "ros2 bag play" ; pkill -9 -f hydra_ros_node ; pkill -f station_server ; sleep 1
 trap 'kill 0' EXIT
-cd /root/hydra_ws/src/hydra-ygg
+cd /root/hydra_ws/src/hydra-yggdrasil
 cargo build --release --bin station_server -q || exit 1
 ./target/release/station_server --robots 3 --align --deform --max-matching \
     --out $L/station.json --dsg-out $L/station_dsg.json --every 10 &

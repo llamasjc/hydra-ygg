@@ -465,7 +465,7 @@ impl NodeIndex {
             .groups
             .entry(group)
             .or_insert_with(|| (sg.new_indexed_layer().id, HashMap::new()));
-        let anon = sg.new_coordinates(x, y, z, Vec::new());
+        let anon = sg.new_coordinates(x as f32, y as f32, z as f32, Vec::new());
         let nid = sg
             .layer_mut(*lid)
             .map_err(|e| e.to_string())?
@@ -511,7 +511,7 @@ impl NodeIndex {
 
     pub fn within(&self, group: i64, x: f64, y: f64, z: f64, radius: f64) -> Vec<ffi::Neighbor> {
         let mut found = self.query(group, [x, y, z], |layer, pos| {
-            layer.nodes_within(pos, radius, scene_graph::PosQueryCount::All)
+            layer.nodes_within(pos, radius as f32, scene_graph::PosQueryCount::All)
         });
         found.sort_by(|a, b| a.distance.total_cmp(&b.distance));
         found
@@ -524,7 +524,7 @@ impl NodeIndex {
         search: impl Fn(
             &scene_graph::Layer,
             &scene_graph::Coordinate,
-        ) -> Vec<(scene_graph::NodeId, f64)>,
+        ) -> Vec<(scene_graph::NodeId, f32)>,
     ) -> Vec<ffi::Neighbor> {
         let Some((lid, ids)) = self.groups.get(&group) else {
             return Vec::new();
@@ -534,7 +534,7 @@ impl NodeIndex {
         };
         search(
             layer,
-            &scene_graph::Coordinate::new(x, y, z),
+            &scene_graph::Coordinate::new(x as f32, y as f32, z as f32),
         )
         .into_iter()
         .map(|(nid, d)| ffi::Neighbor {

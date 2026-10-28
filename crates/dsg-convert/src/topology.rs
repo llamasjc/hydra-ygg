@@ -1,7 +1,7 @@
 //! A Spark-DSG graph's structure (which nodes exist, in which layer, and how they connect)
 //! held in a Yggdrasil `SceneGraph` and edited one operation at a time.
 //!
-//! spark_dsg (with the hydra-ygg backend patch) forwards every node and edge it adds or
+//! spark_dsg (with the hydra-yggdrasil backend patch) forwards every node and edge it adds or
 //! removes here, and answers `hasNode`, `hasEdge`, `numNodes` and `numEdges` from it.
 //!
 //! Mapping:
@@ -83,7 +83,7 @@ impl Topology {
             let key = self.key_of_layer[&layer.id];
             for node in layer.all_nodes() {
                 let id = self.dsg_of[&node.id];
-                let pos = node.coordinates.first().map(|c| [c.x, c.y, c.z]);
+                let pos = node.coordinates.first().map(|c| [c.x as f64, c.y as f64, c.z as f64]);
                 let kept = node
                     .features
                     .iter()
@@ -133,7 +133,7 @@ impl Topology {
         }
         let features = vec![Feature::new(F_DSG_ID, id)];
         let anon = match pos {
-            Some([x, y, z]) => self.sg.new_coordinates(x, y, z, features),
+            Some([x, y, z]) => self.sg.new_coordinates(x as f32, y as f32, z as f32, features),
             None => self.sg.new_node(features),
         };
         let nid = self
@@ -189,7 +189,7 @@ impl Topology {
         if let Some(p) = parent {
             self.sg.detach(nid).from(p).unwrap();
         }
-        let coord = pos.map(|[x, y, z]| Coordinate::new(x, y, z));
+        let coord = pos.map(|[x, y, z]| Coordinate::new(x as f32, y as f32, z as f32));
         let node = self.sg.node(nid).unwrap();
         let bounds = node
             .children()

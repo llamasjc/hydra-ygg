@@ -51,7 +51,7 @@ index 0000000..b0c13fa
 +
 +namespace spark_dsg {
 +
-+//! Told about every node and edge a DynamicSceneGraph gains or loses (hydra-ygg patch).
++//! Told about every node and edge a DynamicSceneGraph gains or loses (hydra-yggdrasil patch).
 +//! Attribute changes are not reported: Hydra edits attributes in place.
 +struct GraphObserver {
 +  virtual ~GraphObserver() = default;

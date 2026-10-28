@@ -62,7 +62,7 @@ index 0000000..6b324f7
 +
 +namespace spark_dsg {
 +
-+//! Alternative storage for a DynamicSceneGraph's structure (hydra-ygg patch), e.g. Yggdrasil.
++//! Alternative storage for a DynamicSceneGraph's structure (hydra-yggdrasil patch), e.g. Yggdrasil.
 +//! Selected with SPARK_DSG_BACKEND: spark (default), yggdrasil (structure queries answered by
 +//! the backend) or both (spark_dsg answers, the backend is checked against it on every query).
 +//! Node and edge attributes stay in spark_dsg either way.

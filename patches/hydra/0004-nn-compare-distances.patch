@@ -19,7 +19,7 @@ index a672166..b5f0601 100644
 -//! Count queries where the alternative backend disagrees with nanoflann.
 -void recordComparison(const char* what, bool same) {
 +//! Compare the alternative backend with nanoflann. Results whose node lists differ but whose
-+//! distance lists agree (to 1e-9 relative) are ties: equally close nodes kept in a different
++//! distance lists agree (to 1e-5 relative) are ties: equally close nodes kept in a different
 +//! order or choice. Anything else is a real difference and is printed in full (first 20).
 +void recordComparison(const char* what,
 +                      const std::vector<size_t>& ids,
@@ -41,7 +41,7 @@ index a672166..b5f0601 100644
 -    std::cerr << "[NearestNodeFinder] " << n << " queries, " << d << " differ from nanoflann"
 -              << std::endl;
 +  for (size_t i = 0; same_dists && i < dists.size(); ++i) {
-+    const double tol = 1e-9 * std::max(1.0, std::abs(dists[i]));
++    const double tol = 1e-5 * std::max(1.0, std::abs(dists[i]));
 +    same_dists = std::abs(dists[i] - other[i].distance) <= tol;
    }
 -}

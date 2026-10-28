@@ -234,7 +234,7 @@ impl ObjectIndex {
                 l
             }
         };
-        let anon = self.sg.new_coordinates(p[0], p[1], p[2], vec![Feature::new("id", id)]);
+        let anon = self.sg.new_coordinates(p[0] as f32, p[1] as f32, p[2] as f32, vec![Feature::new("id", id)]);
         let nid = self.sg.layer_mut(lid).unwrap().push_node(anon).unwrap();
         self.ygg.insert(id, nid);
         self.global.insert(nid, id);
@@ -259,9 +259,10 @@ impl ObjectIndex {
         self.sg
             .layer(*lid)
             .unwrap()
-            .nodes_within(&Coordinate::new(p[0], p[1], p[2]), radius, PosQueryCount::All)
+            // Yggdrasil stores f32: search a hair wider, callers measure exact f64 distances
+            .nodes_within(&Coordinate::new(p[0] as f32, p[1] as f32, p[2] as f32), radius as f32 + 1e-3, PosQueryCount::All)
             .into_iter()
-            .map(|(nid, d)| (self.global[&nid], d))
+            .map(|(nid, d)| (self.global[&nid], d as f64))
             .collect()
     }
 }
@@ -284,6 +285,8 @@ pub struct Station {
     resolved_of: HashMap<EdgeKey, EdgeKey>,
     /// The station graph's structure and positions in Yggdrasil.
     pub topology: Topology,
+    /// Drift correction per node (see [`Station::correct_drift`]), used when matching.
+    offsets: HashMap<u64, [f64; 3]>,
 }
 
 impl Station {
@@ -300,6 +303,7 @@ impl Station {
             resolved: HashMap::new(),
             resolved_of: HashMap::new(),
             topology: Topology::new(HYDRA_LAYERS),
+            offsets: HashMap::new(),
         }
     }
 
@@ -413,7 +417,7 @@ impl Station {
         for e in delta["edges"].as_array().into_iter().flatten() {
             edge_keys.push((e["source"].as_u64().unwrap(), e["target"].as_u64().unwrap()));
         }
-        Ok(self.refresh(robot, transform, &node_ids, &edge_keys))
+        Ok(self.refresh(robot, transform, &node_ids, &edge_keys, BTreeSet::new()))
     }
 
     /// Move robot `robot` to a new transform, e.g. after frame alignment improved.
@@ -423,7 +427,42 @@ impl Station {
         };
         r.transform = transform;
         let ids: Vec<u64> = r.decoder.nodes.keys().copied().collect();
-        self.refresh(robot, transform, &ids, &[])
+        self.refresh(robot, transform, &ids, &[], BTreeSet::new())
+    }
+
+    /// Correct drift between robots ([`deform`], with the merges of `closure_layers` as loop
+    /// closures) and match again on the corrected positions, so nodes that drift kept apart
+    /// can now merge. Corrections stay until the next call; repeat to refine.
+    pub fn correct_drift(&mut self, closure_layers: &[LayerKey]) -> Change {
+        let corrected = self.corrected_positions(closure_layers);
+        let mut dirty: BTreeSet<(u8, String)> = BTreeSet::new();
+        let ids: Vec<u64> = self.objects.pos.keys().copied().collect();
+        for id in ids {
+            let (Some(raw), Some(c)) = (self.nodes.get(&id).and_then(position), corrected.get(&id)) else {
+                continue;
+            };
+            let offset = [c[0] - raw[0], c[1] - raw[1], c[2] - raw[2]];
+            let old = self.offsets.get(&id).copied().unwrap_or([0.0; 3]);
+            if distance(offset, old) < 1e-6 {
+                continue;
+            }
+            self.offsets.insert(id, offset);
+            let group = self.objects.label[&id].clone();
+            self.objects.remove(id);
+            self.objects.insert(id, group.clone(), *c);
+            for r in self.robots.keys().filter(|r| **r >= robot_of(id)) {
+                dirty.insert((*r, group.clone()));
+            }
+        }
+        let robot = *self.robots.keys().next().unwrap_or(&0);
+        let transform = self.transform_of(robot).unwrap_or_default();
+        self.refresh(robot, transform, &[], &[], dirty)
+    }
+
+    /// A node's position for matching: station frame plus its drift correction.
+    fn matching_position(&self, id: u64, p: [f64; 3]) -> [f64; 3] {
+        let o = self.offsets.get(&id).copied().unwrap_or([0.0; 3]);
+        [p[0] + o[0], p[1] + o[1], p[2] + o[2]]
     }
 
     /// Re-read these nodes and edges of `robot` from its decoder and update everything that
@@ -434,14 +473,14 @@ impl Station {
         transform: Transform,
         node_ids: &[u64],
         edge_keys: &[EdgeKey],
+        mut dirty: BTreeSet<(u8, String)>,
     ) -> Change {
         let mut change = Change::default();
         // Nodes whose station-graph presence or attributes may have changed, and robot edges
         // whose station edge may have changed.
         let mut touched_nodes: BTreeSet<u64> = BTreeSet::new();
         let mut touched_edges: BTreeSet<EdgeKey> = BTreeSet::new();
-        // Merge groups whose matching must be worked out again, in robot order.
-        let mut dirty: BTreeSet<(u8, String)> = BTreeSet::new();
+        // Merge groups whose matching must be worked out again, in robot order (`dirty`).
         let later: Vec<u8> = self.robots.keys().copied().filter(|r| *r >= robot).collect();
 
         // 1. robot nodes, in the station frame
@@ -477,7 +516,7 @@ impl Station {
                         for r in &later {
                             dirty.insert((*r, group.clone()));
                         }
-                        let p = position(&n).unwrap();
+                        let p = self.matching_position(id, position(&n).unwrap());
                         self.objects.insert(id, group.clone(), p);
                         self.members.entry((robot, group)).or_default().insert(id);
                     }
@@ -736,7 +775,7 @@ impl Station {
                 let Some((label, radius)) = self.group(n) else {
                     continue;
                 };
-                let p = position(n).unwrap();
+                let p = self.matching_position(*id, position(n).unwrap());
                 for (o, l, q) in &kept {
                     let d = distance(p, *q);
                     if *l == label && d <= radius {
@@ -852,6 +891,10 @@ mod tests {
         check(&station);
         assert!(station.merges.is_empty());
         assert!(station.topology.has_edge(global_id(1, p(1)), global_id(1, o(1))));
+
+        // drift correction keeps the incremental graph equal to the reference
+        station.correct_drift(&[OBJECTS, PLACES, ROOMS]);
+        check(&station);
 
         // robot 1 drifts away: the chair seen again by robot 0 stays separate
         station.receive(0, &ea.encode(&a)).unwrap();

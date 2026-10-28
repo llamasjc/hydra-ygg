@@ -104,6 +104,9 @@ fn main() {
         if last_write.elapsed() >= every && count > 0 {
             last_write = Instant::now();
             report(&station, &deltas, &rules, total_ms / count as f64);
+            if deform {
+                station.correct_drift(&[station::OBJECTS, station::PLACES, station::ROOMS]);
+            }
             if let Some(path) = &out {
                 write(&station, path, dsg_out.as_deref(), deform);
             }

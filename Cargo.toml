@@ -7,10 +7,8 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-# Public Yggdrasil (rev 3b17a94) with positions switched from f32 to f64, so nearest-node
-# results match Hydra's nanoflann. To go back to upstream f32, use:
-# scene-graph = { git = "https://github.com/brdsdsu/Yggdrasil", rev = "3b17a94c57f366fb30b04f1d939a21559797b2c1" }
-scene-graph = { path = "third_party/yggdrasil-f64/scene-graph" }
+# Upstream Yggdrasil, unmodified (f32 positions).
+scene-graph = { git = "https://github.com/brdsdsu/Yggdrasil", rev = "3b17a94c57f366fb30b04f1d939a21559797b2c1" }
 serde_json = "1"
 flate2 = "1"
 dsg-convert = { path = "crates/dsg-convert" }

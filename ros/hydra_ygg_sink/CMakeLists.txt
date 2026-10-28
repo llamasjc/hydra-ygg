@@ -11,7 +11,7 @@ include(FetchContent)
 FetchContent_Declare(Corrosion GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git GIT_TAG v0.5.1)
 FetchContent_MakeAvailable(Corrosion)
 
-# The Rust workspace sits two levels up (hydra-ygg/Cargo.toml).
+# The Rust workspace sits two levels up (hydra-yggdrasil/Cargo.toml).
 corrosion_import_crate(MANIFEST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../../Cargo.toml CRATES ygg-bridge CRATE_TYPES staticlib)
 corrosion_add_cxxbridge(ygg_bridge_cxx CRATE ygg_bridge FILES lib.rs)
 set_target_properties(ygg_bridge_cxx PROPERTIES POSITION_INDEPENDENT_CODE ON)

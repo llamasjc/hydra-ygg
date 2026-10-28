@@ -298,7 +298,7 @@ fn main() {
     } else {
         station.export()
     };
-    let rooms = merge_rooms_by_places(&mut graph);
+    let rooms = station::merge_rooms_by_places(&mut graph);
     println!("  rooms: {rooms} more rooms merged because they share places");
     if let Some(path) = out {
         std::fs::write(&path, graph.to_string()).unwrap();
@@ -306,112 +306,6 @@ fn main() {
     }
 }
 
-/// Rooms of different robots that share places after the place merge are one room. A room joins
-/// another when at least half of the smaller room's places are shared. The joined room keeps the
-/// lowest id, its edges move over, and its position is the mean of its places.
-fn merge_rooms_by_places(graph: &mut Value) -> usize {
-    const ROOMS: (i64, i64) = (4, 0);
-    const PLACES: (i64, i64) = (3, 0);
-    let key = |n: &Value| (n["layer"].as_i64().unwrap_or(-1), n["partition"].as_i64().unwrap_or(0));
-    let mut kind: BTreeMap<u64, (i64, i64)> = BTreeMap::new();
-    for n in graph["nodes"].as_array().unwrap() {
-        kind.insert(n["id"].as_u64().unwrap(), key(n));
-    }
-    let mut places_of: BTreeMap<u64, std::collections::BTreeSet<u64>> = BTreeMap::new();
-    for e in graph["edges"].as_array().unwrap() {
-        let (s, t) = (e["source"].as_u64().unwrap(), e["target"].as_u64().unwrap());
-        for (room, place) in [(s, t), (t, s)] {
-            if kind.get(&room) == Some(&ROOMS) && kind.get(&place) == Some(&PLACES) {
-                places_of.entry(room).or_default().insert(place);
-            }
-        }
-    }
-
-    // union-find over rooms
-    let mut parent: BTreeMap<u64, u64> = places_of.keys().map(|r| (*r, *r)).collect();
-    fn find(parent: &mut BTreeMap<u64, u64>, x: u64) -> u64 {
-        let p = parent[&x];
-        if p == x {
-            return x;
-        }
-        let root = find(parent, p);
-        parent.insert(x, root);
-        root
-    }
-    let rooms: Vec<u64> = places_of.keys().copied().collect();
-    for (i, a) in rooms.iter().enumerate() {
-        for b in &rooms[i + 1..] {
-            if robot_of(*a) == robot_of(*b) {
-                continue;
-            }
-            let (pa, pb) = (&places_of[a], &places_of[b]);
-            let shared = pa.intersection(pb).count();
-            if shared > 0 && 2 * shared >= pa.len().min(pb.len()) {
-                let (ra, rb) = (find(&mut parent, *a), find(&mut parent, *b));
-                if ra != rb {
-                    parent.insert(ra.max(rb), ra.min(rb));
-                }
-            }
-        }
-    }
-    let into: BTreeMap<u64, u64> = rooms
-        .iter()
-        .map(|r| (*r, find(&mut parent, *r)))
-        .filter(|(r, root)| r != root)
-        .collect();
-    if into.is_empty() {
-        return 0;
-    }
-
-    // new room positions: the mean of every place the joined rooms hold
-    let mut members: BTreeMap<u64, std::collections::BTreeSet<u64>> = BTreeMap::new();
-    for r in &rooms {
-        let root = into.get(r).copied().unwrap_or(*r);
-        members.entry(root).or_default().extend(places_of[r].iter().copied());
-    }
-    let pos: BTreeMap<u64, [f64; 3]> = graph["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|n| {
-            let p = n["attributes"]["position"].as_array()?;
-            Some((n["id"].as_u64()?, [p[0].as_f64()?, p[1].as_f64()?, p[2].as_f64()?]))
-        })
-        .collect();
-
-    let nodes = graph["nodes"].as_array_mut().unwrap();
-    nodes.retain(|n| !into.contains_key(&n["id"].as_u64().unwrap()));
-    for n in nodes.iter_mut() {
-        let id = n["id"].as_u64().unwrap();
-        if !into.values().any(|r| *r == id) {
-            continue;
-        }
-        let ps: Vec<[f64; 3]> = members[&id].iter().filter_map(|p| pos.get(p).copied()).collect();
-        if !ps.is_empty() {
-            let k = ps.len() as f64;
-            let mean: Vec<f64> = (0..3).map(|i| ps.iter().map(|p| p[i]).sum::<f64>() / k).collect();
-            n["attributes"]["position"] = serde_json::json!(mean);
-        }
-    }
-
-    let mut seen = std::collections::BTreeSet::new();
-    let edges = graph["edges"].as_array_mut().unwrap();
-    let mut kept = Vec::new();
-    for mut e in edges.drain(..) {
-        for end in ["source", "target"] {
-            let id = e[end].as_u64().unwrap();
-            if let Some(r) = into.get(&id) {
-                e[end] = serde_json::json!(r);
-            }
-        }
-        let (s, t) = (e["source"].as_u64().unwrap(), e["target"].as_u64().unwrap());
-        if s != t && seen.insert((s.min(t), s.max(t))) {
-            kept.push(e);
-        }
-    }
-    *edges = kept;
-    into.len()
-}
 
 /// Maximum one-to-one matching between `a` and `b` where pairs are within `radius` (Kuhn's
 /// augmenting paths, iterative).
@@ -488,7 +382,7 @@ fn matching_ceiling(a: &[[f64; 3]], b: &[[f64; 3]], radius: f64) -> usize {
 fn try_align(station: &mut Station, r: u8) {
     const RADIUS: f64 = 0.3;
     const MIN_INLIERS: usize = 6;
-    let (mine, theirs) = station.alignment_objects(r);
+    let (mine, theirs) = station.alignment_points(r);
     let t0 = Instant::now();
     let Some((t, n)) = station::align::estimate(&mine, &theirs, RADIUS) else {
         return;
@@ -497,7 +391,7 @@ fn try_align(station: &mut Station, r: u8) {
     if n >= MIN_INLIERS && n > current + current / 10 {
         station.set_transform(r, t);
         println!(
-            "align robot {r}: yaw {:.4} rad, translation [{:.3}, {:.3}, {:.3}] m, {n} of {} objects fit (was {current}), {:.0} ms",
+            "align robot {r}: yaw {:.4} rad, translation [{:.3}, {:.3}, {:.3}] m, {n} of {} objects and described places fit (was {current}), {:.0} ms",
             t.yaw,
             t.translation[0],
             t.translation[1],

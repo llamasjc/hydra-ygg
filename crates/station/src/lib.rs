@@ -149,6 +149,18 @@ fn position(n: &Value) -> Option<[f64; 3]> {
     Some([0, 1, 2].map(|i| p[i].as_f64().unwrap()))
 }
 
+/// A robot edge's info, with its spark_dsg record (weight and other attributes) when it has one.
+fn edge_info(e: &Value) -> Value {
+    let mut info = e["info"].clone();
+    if let Some(r) = e.get("record") {
+        if !info.is_object() {
+            info = json!({});
+        }
+        info["record"] = r.clone();
+    }
+    info
+}
+
 fn distance(p: [f64; 3], q: [f64; 3]) -> f64 {
     ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt()
 }
@@ -354,6 +366,23 @@ impl Station {
         (mine, theirs)
     }
 
+    /// [`Station::alignment_objects`] plus places with a descriptor: a place that has objects
+    /// attached is labelled by the sorted labels of those objects, so places count in frame
+    /// alignment too and robots that share few objects can still be aligned.
+    pub fn alignment_points(&self, robot: u8) -> (Vec<align::Labelled>, Vec<align::Labelled>) {
+        let (mut mine, mut theirs) = self.alignment_objects(robot);
+        let r = &self.robots[&robot];
+        mine.extend(described_places(&r.decoder.nodes, r.decoder.edges.keys(), |id| *id));
+        let lower: HashMap<u64, Value> = self
+            .nodes
+            .iter()
+            .filter(|(id, _)| robot_of(**id) < robot)
+            .map(|(id, n)| (*id, n.clone()))
+            .collect();
+        theirs.extend(described_places(&lower, self.raw_edges.keys(), |id| *id));
+        (mine, theirs)
+    }
+
     pub fn transform_of(&self, robot: u8) -> Option<Transform> {
         self.robots.get(&robot).map(|r| r.transform)
     }
@@ -536,7 +565,7 @@ impl Station {
                 .decoder
                 .edges
                 .get(&edge_key(s, t))
-                .map(|e| e["info"].clone());
+                .map(edge_info);
             match info {
                 Some(info) => {
                     self.raw_edges.insert(key, info);
@@ -733,7 +762,9 @@ impl Station {
                 .iter()
                 .map(|p| {
                     let first = self.resolved[*p].first().unwrap();
-                    json!({"source": p.0, "target": p.1, "info": self.raw_edges[first]})
+                    // the robots whose edges this station edge stands for
+                    let robots: BTreeSet<u8> = self.resolved[*p].iter().map(|k| robot_of(k.0)).collect();
+                    json!({"source": p.0, "target": p.1, "info": self.raw_edges[first], "robots": robots})
                 })
                 .collect::<Vec<_>>()
         );
@@ -759,7 +790,7 @@ impl Station {
             for e in g["edges"].as_array().into_iter().flatten() {
                 let s = global_id(r, e["source"].as_u64().unwrap());
                 let t = global_id(r, e["target"].as_u64().unwrap());
-                edges.insert(edge_key(s, t), e["info"].clone());
+                edges.insert(edge_key(s, t), edge_info(e));
             }
         }
 
@@ -823,6 +854,143 @@ impl Station {
         );
         (g, merges)
     }
+}
+
+/// Rooms of different robots that share places after the place merge are one room. A room joins
+/// another when at least half of the smaller room's places are shared. The joined room keeps the
+/// Places with at least one object attached, labelled by the sorted labels of those objects.
+fn described_places<'a>(
+    nodes: &HashMap<u64, Value>,
+    edges: impl Iterator<Item = &'a EdgeKey>,
+    id: impl Fn(&u64) -> u64,
+) -> Vec<align::Labelled> {
+    let mut labels: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+    for (a, b) in edges {
+        let (Some(na), Some(nb)) = (nodes.get(&id(a)), nodes.get(&id(b))) else {
+            continue;
+        };
+        for (p, o) in [(na, nb), (nb, na)] {
+            if layer_key(p) == PLACES && layer_key(o) == OBJECTS {
+                labels
+                    .entry(p["id"].as_u64().unwrap_or(0))
+                    .or_default()
+                    .push(o["attributes"]["semantic_label"].to_string());
+            }
+        }
+    }
+    labels
+        .into_iter()
+        .filter_map(|(pid, mut l)| {
+            l.sort();
+            let n = nodes.get(&pid)?;
+            Some((format!("place:{}", l.join(",")), position(n)?))
+        })
+        .collect()
+}
+
+/// lowest id, its edges move over, and its position is the mean of its places.
+pub fn merge_rooms_by_places(graph: &mut Value) -> usize {
+    const ROOMS: (i64, i64) = (4, 0);
+    const PLACES: (i64, i64) = (3, 0);
+    let key = |n: &Value| (n["layer"].as_i64().unwrap_or(-1), n["partition"].as_i64().unwrap_or(0));
+    let mut kind: BTreeMap<u64, (i64, i64)> = BTreeMap::new();
+    for n in graph["nodes"].as_array().unwrap() {
+        kind.insert(n["id"].as_u64().unwrap(), key(n));
+    }
+    let mut places_of: BTreeMap<u64, std::collections::BTreeSet<u64>> = BTreeMap::new();
+    for e in graph["edges"].as_array().unwrap() {
+        let (s, t) = (e["source"].as_u64().unwrap(), e["target"].as_u64().unwrap());
+        for (room, place) in [(s, t), (t, s)] {
+            if kind.get(&room) == Some(&ROOMS) && kind.get(&place) == Some(&PLACES) {
+                places_of.entry(room).or_default().insert(place);
+            }
+        }
+    }
+
+    // union-find over rooms
+    let mut parent: BTreeMap<u64, u64> = places_of.keys().map(|r| (*r, *r)).collect();
+    fn find(parent: &mut BTreeMap<u64, u64>, x: u64) -> u64 {
+        let p = parent[&x];
+        if p == x {
+            return x;
+        }
+        let root = find(parent, p);
+        parent.insert(x, root);
+        root
+    }
+    let rooms: Vec<u64> = places_of.keys().copied().collect();
+    for (i, a) in rooms.iter().enumerate() {
+        for b in &rooms[i + 1..] {
+            if robot_of(*a) == robot_of(*b) {
+                continue;
+            }
+            let (pa, pb) = (&places_of[a], &places_of[b]);
+            let shared = pa.intersection(pb).count();
+            if shared > 0 && 2 * shared >= pa.len().min(pb.len()) {
+                let (ra, rb) = (find(&mut parent, *a), find(&mut parent, *b));
+                if ra != rb {
+                    parent.insert(ra.max(rb), ra.min(rb));
+                }
+            }
+        }
+    }
+    let into: BTreeMap<u64, u64> = rooms
+        .iter()
+        .map(|r| (*r, find(&mut parent, *r)))
+        .filter(|(r, root)| r != root)
+        .collect();
+    if into.is_empty() {
+        return 0;
+    }
+
+    // new room positions: the mean of every place the joined rooms hold
+    let mut members: BTreeMap<u64, std::collections::BTreeSet<u64>> = BTreeMap::new();
+    for r in &rooms {
+        let root = into.get(r).copied().unwrap_or(*r);
+        members.entry(root).or_default().extend(places_of[r].iter().copied());
+    }
+    let pos: BTreeMap<u64, [f64; 3]> = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| {
+            let p = n["attributes"]["position"].as_array()?;
+            Some((n["id"].as_u64()?, [p[0].as_f64()?, p[1].as_f64()?, p[2].as_f64()?]))
+        })
+        .collect();
+
+    let nodes = graph["nodes"].as_array_mut().unwrap();
+    nodes.retain(|n| !into.contains_key(&n["id"].as_u64().unwrap()));
+    for n in nodes.iter_mut() {
+        let id = n["id"].as_u64().unwrap();
+        if !into.values().any(|r| *r == id) {
+            continue;
+        }
+        let ps: Vec<[f64; 3]> = members[&id].iter().filter_map(|p| pos.get(p).copied()).collect();
+        if !ps.is_empty() {
+            let k = ps.len() as f64;
+            let mean: Vec<f64> = (0..3).map(|i| ps.iter().map(|p| p[i]).sum::<f64>() / k).collect();
+            n["attributes"]["position"] = serde_json::json!(mean);
+        }
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let edges = graph["edges"].as_array_mut().unwrap();
+    let mut kept = Vec::new();
+    for mut e in edges.drain(..) {
+        for end in ["source", "target"] {
+            let id = e[end].as_u64().unwrap();
+            if let Some(r) = into.get(&id) {
+                e[end] = serde_json::json!(r);
+            }
+        }
+        let (s, t) = (e["source"].as_u64().unwrap(), e["target"].as_u64().unwrap());
+        if s != t && seen.insert((s.min(t), s.max(t))) {
+            kept.push(e);
+        }
+    }
+    *edges = kept;
+    into.len()
 }
 
 #[cfg(test)]

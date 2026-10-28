@@ -6,9 +6,10 @@
 //! replay --align. Every --every seconds the station graph is written to --out, and with
 //! --dsg-out also converted for Hydra's static visualizer (station_to_dsg from PATH, or through
 //! `ros2 run`, so source the ROS workspace). --deform writes the graph with drift between robots
-//! corrected (see station::deform).
+//! corrected (see station::deform). --rooms detects rooms again on the merged places in the
+//! --dsg-out file (Hydra's RoomFinder, through station_to_dsg).
 //!
-//! usage: station_server --robots N [--port 7447] [--align] [--deform] [--max-matching]
+//! usage: station_server --robots N [--port 7447] [--align] [--deform] [--rooms] [--max-matching]
 //!                       [--out station.json] [--dsg-out station_dsg.json] [--every 5]
 
 use std::collections::BTreeMap;
@@ -35,7 +36,7 @@ fn main() {
     };
     let flag = |name: &str| args.iter().any(|a| a == name);
     let Some(robots) = value("--robots").map(|v| v.parse::<u8>().unwrap()) else {
-        eprintln!("usage: station_server --robots N [--port 7447] [--align] [--deform] [--max-matching] [--out station.json] [--dsg-out station_dsg.json] [--every 5]");
+        eprintln!("usage: station_server --robots N [--port 7447] [--align] [--deform] [--rooms] [--max-matching] [--out station.json] [--dsg-out station_dsg.json] [--every 5]");
         std::process::exit(2);
     };
     let port: u16 = value("--port").map_or(7447, |v| v.parse().unwrap());
@@ -44,6 +45,7 @@ fn main() {
     let dsg_out = value("--dsg-out");
     let align = flag("--align");
     let deform = flag("--deform");
+    let rooms = flag("--rooms");
 
     let mut config = Config::default();
     config.max_matching = flag("--max-matching");
@@ -108,7 +110,7 @@ fn main() {
                 station.correct_drift(&[station::OBJECTS, station::PLACES, station::ROOMS]);
             }
             if let Some(path) = &out {
-                write(&station, path, dsg_out.as_deref(), deform);
+                write(&station, path, dsg_out.as_deref(), deform, rooms);
             }
         }
     }
@@ -140,13 +142,14 @@ fn report(station: &Station, deltas: &BTreeMap<u8, usize>, rules: &[station::Mer
 
 /// Write the station graph (through a temporary file, so readers never see half of it), and
 /// convert it for the visualizer.
-fn write(station: &Station, path: &str, dsg: Option<&str>, deform: bool) {
+fn write(station: &Station, path: &str, dsg: Option<&str>, deform: bool, rooms: bool) {
     let tmp = format!("{path}.tmp");
-    let graph = if deform {
+    let mut graph = if deform {
         station.export_corrected(&[station::OBJECTS, station::PLACES, station::ROOMS])
     } else {
         station.export()
     };
+    station::merge_rooms_by_places(&mut graph);
     if let Err(e) = std::fs::write(&tmp, graph.to_string()).and_then(|_| std::fs::rename(&tmp, path)) {
         eprintln!("{path}: {e}");
         return;
@@ -158,6 +161,7 @@ fn write(station: &Station, path: &str, dsg: Option<&str>, deform: bool) {
             std::process::Command::new(cmd)
                 .args(pre)
                 .args([path, tmp.as_str()])
+                .args(rooms.then_some("--rooms"))
                 .stdout(std::process::Stdio::null())
                 .status()
         };
@@ -177,7 +181,7 @@ fn write(station: &Station, path: &str, dsg: Option<&str>, deform: bool) {
 fn try_align(station: &mut Station, r: u8) {
     const RADIUS: f64 = 0.3;
     const MIN_INLIERS: usize = 6;
-    let (mine, theirs) = station.alignment_objects(r);
+    let (mine, theirs) = station.alignment_points(r);
     let Some((t, n)) = station::align::estimate(&mine, &theirs, RADIUS) else {
         return;
     };
@@ -185,7 +189,7 @@ fn try_align(station: &mut Station, r: u8) {
     if n >= MIN_INLIERS && n > current + current / 10 {
         station.set_transform(r, t);
         println!(
-            "align robot {r}: yaw {:.4} rad, translation [{:.3}, {:.3}, {:.3}] m, {n} of {} objects fit (was {current})",
+            "align robot {r}: yaw {:.4} rad, translation [{:.3}, {:.3}, {:.3}] m, {n} of {} objects and described places fit (was {current})",
             t.yaw,
             t.translation[0],
             t.translation[1],

@@ -178,6 +178,19 @@ After correcting, the station matches again on the corrected positions
 report), so nodes drift had kept apart merge too. On the bent run: objects 28 to 53 merged, places
 1,044 to 1,097; the incremental result still equals the full rebuild.
 
-Not yet: rooms re-segmented on the merged places (rooms of different robots are joined when they
-share places), and loop closures found from place descriptors when maps start too far apart for
-object alignment.
+Frame alignment also uses places: a place with objects attached is described by the sorted
+labels of those objects and matched like an object. On the office runs started from a wrong
+frame this fits 116 points instead of 14 objects and recovers the frame exactly.
+
+Rooms of different robots are joined when at least half of the smaller room's places are shared,
+in replay and in the live station's output.
+
+Loop closures are robust: drift correction weighs every merge by graduated non-convexity with
+a truncated least squares cost (as Hydra-Multi's robust optimisation does), so a wrong merge ends
+up with weight 0 instead of bending the map. The robots' trajectories (agent layer) are corrected
+with the rest of the graph. On the bent run this raised the re-merged objects from 53 to 63 and
+places from 1,097 to 1,147.
+
+Rooms are detected again on the merged places with Hydra's own `RoomFinder` (uHumans2 settings),
+as Hydra-Multi does on its merged graph: `station_to_dsg station.json out.json --rooms`, or
+`station_server --dsg-out out.json --rooms`.
